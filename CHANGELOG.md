@@ -117,6 +117,10 @@ in the README). Paste the matching section below into the GitHub release.
   transit the same way. Saves go through the same validated, atomic config.json
   write as the rest of the settings (a .bak of the previous version is kept), and
   the panel prompts for the restart that applies them.
+- **Quick PTZ pad**: cameras with PTZ support now show a small pan/tilt pad
+  directly on the maximized tile and quick view, next to the digital zoom
+  control — no need to open the full camera settings panel just to nudge a
+  camera. Hold an arrow to move, release to stop.
 
 ### Fixed
 
@@ -185,6 +189,12 @@ in the README). Paste the matching section below into the GitHub release.
   drawer, the event-preview and camera-settings modals are vertically centered
   instead of anchored to the bottom, and the scheduled-capture summary wraps
   instead of being clipped.
+- **Home Assistant add-on dropped `channel_id`**: cameras configured through
+  the add-on's Configuration tab (rather than by hand in `config.json`) had no
+  way to set an NVR channel, and the launcher script silently stripped the
+  field even if added manually — every camera behind the same NVR address
+  collided on channel 0. The add-on schema and launcher now carry `channel_id`
+  through correctly (stable and beta channels both).
 
 ## 0.8.8
 

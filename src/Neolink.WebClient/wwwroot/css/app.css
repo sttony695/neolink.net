@@ -2536,6 +2536,38 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
 .zoom-panning video { cursor: grabbing; }
 .zoom-panning { user-select: none; }
 
+/* Quick PTZ pad: same corner-pill treatment as .zoom-hud, opposite side so
+   the two never overlap. Real pan/tilt, so — unlike zoom — there's no idle
+   fade: losing the pad mid-drag would strand a pointerup the browser never
+   delivered, leaving the camera panning forever. */
+.ptz-hud {
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 6;
+    display: none;
+    padding: 6px;
+    background: color-mix(in srgb, var(--panel) 82%, transparent);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    backdrop-filter: blur(6px);
+}
+
+.zoom-on:hover .ptz-hud,
+.zoom-on.zoomed .ptz-hud,
+.tile:fullscreen:hover .ptz-hud,
+.tile:fullscreen.zoomed .ptz-hud {
+    display: block;
+}
+
+.ptz-hud .ptz-pad {
+    grid-template-columns: repeat(3, 30px);
+    grid-auto-rows: 30px;
+}
+
+.ptz-hud .tool-btn { font-size: 13px; }
+
 /* ------------------------------------------------------------ timeline page */
 
 .tl-page {

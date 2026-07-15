@@ -540,6 +540,10 @@
                             <button class="icon-btn" title="Remove" @onclick="() => CloseSlot(index)">✕</button>
                         </div>
                         @ZoomHud
+                        @if (_maxIndex == index && PtzSupported(slot.Camera))
+                        {
+                            @PtzHud(slot.Camera!)
+                        }
                         @if (camera != null && ClipActive(camera.Name))
                         {
                             @* Always-on indicator while an on-demand clip records (any trigger:
@@ -628,6 +632,10 @@
                     </div>
                 }
                 @ZoomHud
+                @if (PtzSupported(qv.Camera))
+                {
+                    @PtzHud(qv.Camera!)
+                }
                 @if (TalkActive(qv.Camera!))
                 {
                     <div class="talk-overlay @(_talkPhase == "live" ? "live" : "connecting")"
@@ -3241,6 +3249,27 @@
         <button type="button" class="icon-btn zoom-btn zoom-reset" data-zoom="reset" title="Restore 1:1 (or double-click the video)">1:1</button>
     </div>;
 
+    // Quick PTZ HUD: real physical pan/tilt (unlike the digital ZoomHud above),
+    // so every button rides Blazor's circuit to POST /ptz. Shown next to
+    // ZoomHud on cameras whose capabilities advertise PTZ support.
+    private RenderFragment PtzHud(string cam) => @<div class="ptz-hud" @onclick:stopPropagation="true" @ondblclick:stopPropagation="true">
+        <div class="ptz-pad">
+            <span></span>
+            <button type="button" class="tool-btn" title="Up (hold)"
+                    @onpointerdown='() => PtzAsync(cam, "up")' @onpointerup="() => PtzStopAsync(cam)" @onpointerleave="() => PtzStopAsync(cam)">▲</button>
+            <span></span>
+            <button type="button" class="tool-btn" title="Left (hold)"
+                    @onpointerdown='() => PtzAsync(cam, "left")' @onpointerup="() => PtzStopAsync(cam)" @onpointerleave="() => PtzStopAsync(cam)">◀</button>
+            <button type="button" class="tool-btn" title="Stop" @onclick="() => PtzStopAsync(cam)">■</button>
+            <button type="button" class="tool-btn" title="Right (hold)"
+                    @onpointerdown='() => PtzAsync(cam, "right")' @onpointerup="() => PtzStopAsync(cam)" @onpointerleave="() => PtzStopAsync(cam)">▶</button>
+            <span></span>
+            <button type="button" class="tool-btn" title="Down (hold)"
+                    @onpointerdown='() => PtzAsync(cam, "down")' @onpointerup="() => PtzStopAsync(cam)" @onpointerleave="() => PtzStopAsync(cam)">▼</button>
+            <span></span>
+        </div>
+    </div>;
+
     private void OnTileClick(int index, MouseEventArgs e)
     {
         // An empty tile invites a click: open the camera picker right there
@@ -3421,7 +3450,7 @@
             return;
         }
         _missingCamera = null;
-        _ = EnsureTalkCapAsync(cam.Name); // decides whether the mic button shows
+        _ = EnsureQuickCapsAsync(cam.Name); // decides whether the mic/PTZ controls show
 
         // An explicit /main|/sub|/ext segment pins the stream; without one the
         // maximize auto-main logic decides (and restores) as usual.
@@ -3579,7 +3608,7 @@
         if (s == null) return;
         _quickView = new ViewSlot { Camera = cam.Name, Kind = s.Kind, Path = s.Path };
         _sidebarOpen = false;
-        _ = EnsureTalkCapAsync(cam.Name); // decides whether the mic button shows
+        _ = EnsureQuickCapsAsync(cam.Name); // decides whether the mic/PTZ controls show
     }
 
     private void CloseQuickView()
@@ -3602,14 +3631,19 @@
     // ------------------------------------------------------------ two-way talk
 
     // The mic button lives on the single-camera surfaces (maximized tile, quick
-    // view) and only on cameras whose capabilities advertise talk support.
+    // view) and only on cameras whose capabilities advertise talk support. The
+    // quick PTZ pad (below) rides the same probe and the same surfaces.
     private string? _talkCamera;        // camera with an active/starting session
     private string _talkPhase = "off";  // connecting | live | off
     private string? _talkError;         // one-shot toast text
     private readonly Dictionary<string, bool> _talkCaps = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, bool> _ptzCaps = new(StringComparer.OrdinalIgnoreCase);
 
     private bool TalkSupported(string? cam) =>
         cam != null && _talkCaps.TryGetValue(cam, out var t) && t;
+
+    private bool PtzSupported(string? cam) =>
+        cam != null && _ptzCaps.TryGetValue(cam, out var t) && t;
 
     private bool TalkActive(string cam) =>
         _talkCamera != null && string.Equals(_talkCamera, cam, StringComparison.OrdinalIgnoreCase);
@@ -3621,13 +3655,15 @@
         TalkActive(cam) ? "Stop talking" : "Talk through the camera's speaker";
 
     /// <summary>
-    /// Looks up (once per camera) whether it supports two-way talk. Offline
-    /// cameras are re-probed on the next surface open instead of being cached.
+    /// Looks up (once per camera) whether it supports two-way talk and/or PTZ.
+    /// Offline cameras are re-probed on the next surface open instead of being
+    /// cached.
     /// </summary>
-    private async Task EnsureTalkCapAsync(string? cam)
+    private async Task EnsureQuickCapsAsync(string? cam)
     {
         if (cam == null || Locked || _talkCaps.ContainsKey(cam)) return;
         _talkCaps[cam] = false; // placeholder: one probe in flight per camera
+        _ptzCaps[cam] = false;
         try
         {
             using var res = await Http.SendAsync(ApiRequest(HttpMethod.Get,
@@ -3635,24 +3671,29 @@
             if (!res.IsSuccessStatusCode)
             {
                 _talkCaps.Remove(cam);
+                _ptzCaps.Remove(cam);
                 return;
             }
             var json = await res.Content.ReadFromJsonAsync<JsonElement>();
             if (!json.TryGetProperty("online", out var on) || !on.GetBoolean())
             {
                 _talkCaps.Remove(cam);
+                _ptzCaps.Remove(cam);
                 return;
             }
-            if (json.TryGetProperty("features", out var f)
-                && f.TryGetProperty("talk", out var t) && t.ValueKind == JsonValueKind.True)
+            if (json.TryGetProperty("features", out var f))
             {
-                _talkCaps[cam] = true;
+                if (f.TryGetProperty("talk", out var t) && t.ValueKind == JsonValueKind.True)
+                    _talkCaps[cam] = true;
+                if (f.TryGetProperty("ptz", out var p) && p.ValueKind == JsonValueKind.True)
+                    _ptzCaps[cam] = true;
                 await InvokeAsync(StateHasChanged);
             }
         }
         catch
         {
             _talkCaps.Remove(cam);
+            _ptzCaps.Remove(cam);
         }
     }
 
@@ -3736,6 +3777,30 @@
         }
         StateHasChanged();
     });
+
+    // ------------------------------------------------------------ quick PTZ
+
+    // A trimmed-down version of CameraPanel's PTZ pad, for the single-camera
+    // surfaces only (maximized tile, quick view) — no speed control, hold to
+    // move at a fixed default speed. Full control (speed, presets) stays in
+    // the camera settings panel.
+    private const float QuickPtzSpeed = 32;
+
+    private async Task PtzAsync(string cam, string command)
+    {
+        try
+        {
+            var req = ApiRequest(HttpMethod.Post, $"/api/cameras/{Uri.EscapeDataString(cam)}/ptz");
+            req.Content = JsonContent.Create(new { command, speed = QuickPtzSpeed });
+            await Http.SendAsync(req);
+        }
+        catch
+        {
+            // best-effort — a dropped PTZ command isn't worth surfacing an error for
+        }
+    }
+
+    private Task PtzStopAsync(string cam) => PtzAsync(cam, "stop");
 
     private void RestoreFromBackup()
     {
