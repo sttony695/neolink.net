@@ -1697,6 +1697,21 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
 
 .cam-rail:hover, .cam-rail:focus-within, .cam-rail.open { opacity: 1; }
 
+/* Grid tile: no zoom HUD to hang under and far less height to spare. Anchor the
+   rail to the bottom-right just above the tile bar, and shrink the controls so
+   the pad still fits on a small wall tile. */
+.cam-rail-grid {
+    top: auto;
+    bottom: 46px;
+    right: 8px;
+    gap: 6px;
+}
+
+.cam-rail-grid .cam-rail-pill { padding: 4px; }
+.cam-rail-grid .cam-rail-btn { width: 26px; height: 26px; font-size: 9px; }
+.cam-rail-grid .ptz-overlay-pad { padding: 4px; gap: 3px; }
+.cam-rail-grid .ptz-overlay-pad button { width: 30px; height: 30px; font-size: 12px; }
+
 .cam-rail-pill {
     display: flex;
     flex-direction: column;

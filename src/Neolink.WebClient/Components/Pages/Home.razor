@@ -851,7 +851,7 @@
                                 <span class="talk-overlay-label">@(_talkPhase == "live" ? T["TALKING"] : T["CONNECTING…"])</span>
                             </div>
                         }
-                        @if (_maxIndex == index && slot.Camera != null)
+                        @if (slot.Camera != null && (_maxIndex == index || (_mode == "grid" && _maxIndex == null && PtzSupported(slot.Camera))))
                         {
                             @* On-video camera rail: a quiet glass pill on the right edge,
                                directly under the zoom HUD (same look, same edge — the two
@@ -860,12 +860,19 @@
                                starts/stops two-way talk; the gear opens the camera's
                                settings dialog (every camera has one, so the rail always
                                renders on the maximized tile). Pointer events stop here so
-                               holding an arrow never starts the digital-zoom drag. *@
+                               holding an arrow never starts the digital-zoom drag.
+                               On a plain grid tile the rail shows up only for PTZ cameras
+                               and carries just the pan/tilt pad — mic and settings stay a
+                               maximize away, but nudging a wall camera doesn't. *@
                             var railCam = slot.Camera!;
-                            <div class="cam-rail @(_ptzPadOpen || TalkActive(railCam) ? "open" : "")"
+                            var railMaxed = _maxIndex == index;
+                            var padOpen = PtzPadOpen(railCam);
+                            var railClass = railMaxed ? "cam-rail" : "cam-rail cam-rail-grid";
+                            var railOpen = padOpen || TalkActive(railCam);
+                            <div class="@railClass @(railOpen ? "open" : "")"
                                  @onclick:stopPropagation="true" @ondblclick:stopPropagation="true"
                                  @onpointerdown:stopPropagation="true" @onpointerup:stopPropagation="true">
-                                @if (_ptzPadOpen && PtzSupported(slot.Camera))
+                                @if (padOpen && PtzSupported(railCam))
                                 {
                                     <div class="ptz-overlay-pad">
                                         <button class="ptz-ov-up" title="@T["Pan up (hold)"]"
@@ -889,19 +896,22 @@
                                     </div>
                                 }
                                 <div class="cam-rail-pill">
-                                    @if (PtzSupported(slot.Camera))
+                                    @if (PtzSupported(railCam))
                                     {
-                                        <button class="cam-rail-btn cam-rail-ptz @(_ptzPadOpen ? "rail-active" : "")"
-                                                title="@(_ptzPadOpen ? T["Hide pan/tilt controls"] : T["Pan / tilt the camera"])"
-                                                @onclick="() => _ptzPadOpen = !_ptzPadOpen">PTZ</button>
+                                        <button class="cam-rail-btn cam-rail-ptz @(padOpen ? "rail-active" : "")"
+                                                title="@(padOpen ? T["Hide pan/tilt controls"] : T["Pan / tilt the camera"])"
+                                                @onclick="() => TogglePtzPad(railCam)">PTZ</button>
                                     }
-                                    @if (TalkSupported(slot.Camera))
+                                    @if (railMaxed && TalkSupported(railCam))
                                     {
                                         <button class="cam-rail-btn @TalkClass(railCam)" title="@TalkTitle(railCam)"
                                                 @onclick="() => ToggleTalkAsync(railCam)">@UiIcon.Render("mic", 14)</button>
                                     }
-                                    <button class="cam-rail-btn" title="@T["Camera settings & controls"]"
-                                            @onclick="() => _panelCamera = railCam">@UiIcon.Render("gear", 14)</button>
+                                    @if (railMaxed)
+                                    {
+                                        <button class="cam-rail-btn" title="@T["Camera settings & controls"]"
+                                                @onclick="() => _panelCamera = railCam">@UiIcon.Render("gear", 14)</button>
+                                    }
                                 </div>
                             </div>
                         }
@@ -6234,7 +6244,7 @@
         {
             RevertAutoMainSwitch(); // the outgoing card gets its stream back first
             _maxIndex = index;
-            _ptzPadOpen = false; // each camera's pad starts collapsed
+            _ptzPadCams.Clear(); // every pad starts collapsed on a view change
             changed = true;
         }
         var target = _slots[index];
@@ -6365,7 +6375,7 @@
         RevertAutoMainSwitch();
         ReturnBorrowedSlot();
         _maxIndex = null;
-        _ptzPadOpen = false;
+        _ptzPadCams.Clear();
         _ = SaveAsync();
     }
 
@@ -6460,10 +6470,20 @@
     // Same press-and-hold semantics as the panel: pointer down starts the move,
     // pointer up/leave stops it. Probed by EnsureSurfaceCapsAsync.
     private readonly Dictionary<string, bool> _ptzCaps = new(StringComparer.OrdinalIgnoreCase);
-    private bool _ptzPadOpen;
+    // Which cameras currently have their on-video PTZ pad expanded. Keyed by name
+    // so every PTZ tile on the grid keeps its own pad state — the maximized tile
+    // is just one more entry.
+    private readonly HashSet<string> _ptzPadCams = new(StringComparer.OrdinalIgnoreCase);
 
     private bool PtzSupported(string? cam) =>
         cam != null && _ptzCaps.TryGetValue(cam, out var p) && p;
+
+    private bool PtzPadOpen(string? cam) => cam != null && _ptzPadCams.Contains(cam);
+
+    private void TogglePtzPad(string cam)
+    {
+        if (!_ptzPadCams.Remove(cam)) _ptzPadCams.Add(cam);
+    }
 
     private async Task PtzMoveAsync(string cam, string command)
     {
@@ -6765,6 +6785,17 @@
                 _quickAttached = quick;
             }
         }
+
+        // The grid shows a pan/tilt pad on PTZ tiles, but only once the capability
+        // probe has answered for that camera. Kick it for every visible tile while
+        // the wall is up — EnsureSurfaceCapsAsync caches per camera and only forces
+        // a re-render when it actually finds PTZ (or talk), so this cannot loop.
+        if (_maxIndex == null && _mode == "grid" && !Locked)
+            foreach (var s in _slots)
+                if (s.Camera is { } capCam
+                    && !_ptzCaps.ContainsKey(capCam)
+                    && _cameras.FirstOrDefault(c => c.Name == capCam) is { Online: true })
+                    _ = EnsureSurfaceCapsAsync(capCam);
 
         // This runs from OnAfterRender, so a tile that only just became known as a
         // battery tile has already painted without its overlay. Re-render once so it
