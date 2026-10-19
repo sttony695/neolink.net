@@ -61,12 +61,15 @@ public sealed class EventRecorder
 
     /// <param name="hubsByKind">The camera's streams by kind, enabling the per-camera
     /// "record from main/sub" runtime choice; null pins recording to <paramref name="hub"/>.</param>
+    /// <param name="prerollWanted">Whether to keep a pre-roll now; null = always. A camera
+    /// that may never detect anything holds none (a clip it records starts at the next keyframe).</param>
     public EventRecorder(string camera, IStreamHub hub, ICameraControl control,
         EventStore store, RecordingConfig cfg, RecordingSettings settings,
         IStreamHub? previewHub = null, IReadOnlyDictionary<string, IStreamHub>? hubsByKind = null,
         Func<bool>? hasRoom = null, Action<string>? onWriteError = null,
-        Neolink.Ai.AiDescriber? ai = null)
+        Neolink.Ai.AiDescriber? ai = null, Func<bool>? prerollWanted = null)
     {
+        _prerollWanted = prerollWanted;
         _ai = ai;
         _camera = camera;
         _hub = hub;
@@ -78,6 +81,20 @@ public sealed class EventRecorder
         _settings = settings;
         _hasRoom = hasRoom;
         _onWriteError = onWriteError;
+    }
+
+    private readonly Func<bool>? _prerollWanted;
+
+    /// <summary>Adds a packet to a pre-roll buffer, or empties it while none is wanted. Caller holds _mediaGate.</summary>
+    private void KeepForPreroll(List<(HubPacket Packet, bool Gap)> buffer, HubPacket packet, bool gap)
+    {
+        if (_prerollWanted?.Invoke() == false)
+        {
+            if (buffer.Count > 0) buffer.Clear();
+            return;
+        }
+        buffer.Add((packet, gap));
+        if (packet is HubVideo) TrimPreroll(buffer);
     }
 
     /// <summary>Free-space guard for the clips tier; null = never blocks.</summary>
@@ -378,8 +395,7 @@ public sealed class EventRecorder
                             }
                             else
                             {
-                                _preroll.Add((packet, gap));
-                                if (packet is HubVideo) TrimPreroll(_preroll);
+                                KeepForPreroll(_preroll, packet, gap);
                             }
                         }
                     }
@@ -465,9 +481,7 @@ public sealed class EventRecorder
                     }
                     else
                     {
-                        var buffer = preview ? _previewPreroll : _preroll;
-                        buffer.Add((packet, gap));
-                        if (packet is HubVideo) TrimPreroll(buffer);
+                        KeepForPreroll(preview ? _previewPreroll : _preroll, packet, gap);
                     }
                 }
             }
@@ -588,7 +602,7 @@ public sealed class EventRecorder
                 labels = LabelsOf(push).Where(settings.AllowsLabel).ToList();
                 if (labels.Count == 0)
                 {
-                    NoteDiscarded(push, "every label is unticked in this camera's event types");
+                    NoteDiscarded(push, "none of its labels are ticked in this camera's event types");
                     continue;
                 }
             }
@@ -618,7 +632,7 @@ public sealed class EventRecorder
             return;
         _lastDiscardReason = reason;
         _lastDiscardLog = now;
-        Log.Info($"{_camera}: detection push ({string.Join("+", LabelsOf(push))}) NOT recorded — {reason}");
+        Log.Info($"{_camera}: detection push ({string.Join("+", LabelsOf(push))}) NOT recorded: {reason}");
     }
 
     private async Task RunEventAsync(List<string> initialLabels, bool provisional,
@@ -743,8 +757,8 @@ public sealed class EventRecorder
                     // filtered label cannot confirm the wake, so the footage
                     // gets discarded as if nothing happened.
                     NoteDiscarded(push, provisional
-                        ? "every label is unticked in this camera's event types, so it cannot confirm the wake recording"
-                        : "every label is unticked in this camera's event types (event not extended)");
+                        ? "none of its labels are ticked in this camera's event types, so it cannot confirm the wake recording"
+                        : "none of its labels are ticked in this camera's event types (event not extended)");
                     continue;
                 }
                 active = true;
@@ -829,6 +843,8 @@ public sealed class EventRecorder
         // nothing about what landed).
         if (closingWriter is { } cw && cw.Completion.IsCompletedSuccessfully && !cw.WroteVideo)
             rec.HasClip = false;
+        else if (closingWriter is { WroteVideo: true } done)
+            rec.ClipSeconds = Math.Round(done.DurationSeconds, 1);
         if (closingPreview is { } cp && cp.Completion.IsCompletedSuccessfully && !cp.WroteVideo)
             rec.HasPreview = false;
         rec.Ongoing = false;
@@ -996,9 +1012,21 @@ public sealed class EventRecorder
         try
         {
             var jpeg = await _control.SnapshotAsync(ct).ConfigureAwait(false);
-            if (jpeg is not { Length: > 100 } || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
+            // A non-Reolink camera may have no snapshot command at all, or one that
+            // came back empty; its only other picture is the stream this very event
+            // is being cut from. A Reolink camera keeps its own snap, full stop —
+            // decoding video here is not something its event path has ever paid.
+            // From whichever stream is carrying video right now: the sub stream when it is
+            // (a small frame decodes fastest), else the one being recorded.
+            if (!IsJpeg(jpeg) && _control.OnvifOnly
+                && (_previewHub is { HasBufferedGop: true } ? _previewHub
+                    : (_activeRecordHub ?? _hub) is { HasBufferedGop: true } buffered ? buffered
+                    : _previewHub is { LiveVideo: true } ? _previewHub
+                    : (_activeRecordHub ?? _hub) is { LiveVideo: true } live ? live : null) is { } hub)
+                jpeg = await Neolink.Media.FrameGrab.FromHubAsync(hub, 720, ct).ConfigureAwait(false);
+            if (!IsJpeg(jpeg))
                 return; // not a JPEG (or camera doesn't support snapshots)
-            await FootageVault.WriteAllBytesAsync(Path.Combine(_store.EventDir(rec), "thumb.jpg"), jpeg, ct)
+            await FootageVault.WriteAllBytesAsync(Path.Combine(_store.EventDir(rec), "thumb.jpg"), jpeg!, ct)
                 .ConfigureAwait(false);
             rec.HasThumb = true;
             _store.Save(rec);
@@ -1008,6 +1036,8 @@ public sealed class EventRecorder
             Log.Debug($"{_camera}: event snapshot failed: {Log.Flatten(ex)}");
         }
     }
+
+    private static bool IsJpeg(byte[]? b) => Neolink.Media.FrameGrab.IsJpeg(b);
 
     /// <summary>Camera AI classifications → normalized event labels.</summary>
     internal static List<string> LabelsOf(MotionPush push)
@@ -1034,6 +1064,9 @@ public sealed class EventRecorder
             "crossline" or "cross_line" or "tripwire" => "line-crossing",
             "intrude" or "intrusion" or "region" or "perimeter" => "intrusion",
             "linger" or "loiter" or "loitering" => "loitering",
+            // Firmware rule names (smart_ai): "legacy" = an object left behind, "loss" = one taken away.
+            "legacy" or "object-left" => "object-left",
+            "loss" or "object-taken" => "object-taken",
             _ => t,
         }).Distinct().ToList();
         return labels.Count > 0 ? labels : new List<string> { "motion" };

@@ -19,7 +19,7 @@ namespace Neolink.Mqtt;
 /// Per camera it publishes (all retained, so HA repopulates after a restart):
 ///   • binary_sensor: motion, person, vehicle, animal,
 ///                    package, line crossing, intrusion,
-///                    loitering                          (from the alarm pushes)
+///                    loitering, object left/taken       (from the alarm pushes)
 ///   • binary_sensor: siren sounding                     (from the status pushes)
 ///   • switch:        siren — ON sounds until OFF        (audio-alarm cameras)
 ///   • switch:        privacy mode — camera dark         (cameras answering msg 574)
@@ -114,7 +114,8 @@ public sealed class HomeAssistantMqtt
     /// pushes (feature absent, or not configured in the Reolink app) simply stays
     /// Clear — visible-but-idle beats invisible-until-it-happens.</summary>
     internal static readonly string[] DetectionLabels =
-        { "motion", "person", "vehicle", "animal", "package", "crying", "line-crossing", "intrusion", "loitering" };
+        { "motion", "person", "vehicle", "animal", "package", "crying", "line-crossing", "intrusion", "loitering",
+          "object-left", "object-taken" };
 
     private readonly MqttConfig _cfg;
     private readonly string _version;
@@ -162,6 +163,10 @@ public sealed class HomeAssistantMqtt
     /// tiers that actually exist are published (a plain single-folder install
     /// gets none of the clips/archive sensors).</summary>
     public Recording.StorageLocations? Storage { get; init; }
+
+    /// <summary>Emergency mode (beta), published as a switch on the server device.
+    /// Null when the feature is not wired.</summary>
+    public Notifications.EmergencyMode? Emergency { get; init; }
 
     private bool ServerStatsEnabled => Monitor != null && _cfg.StatsIntervalSeconds > 0;
 
@@ -271,6 +276,7 @@ public sealed class HomeAssistantMqtt
             .ConfigureAwait(false);
         // One wildcard per camera captures every ".../{entity}/set" command.
         var subs = _cameras.Values.Select(c => $"{_cfg.BaseTopic}/{c.Id}/+/set").ToList();
+        if (Emergency != null && !ServerTopicTaken) subs.Add($"{_cfg.BaseTopic}/server/+/set");
         await _client.SubscribeAsync(subs, CancellationToken.None).ConfigureAwait(false);
         foreach (var cam in _cameras.Values)
             await cam.AnnounceAsync(CancellationToken.None).ConfigureAwait(false);
@@ -278,6 +284,81 @@ public sealed class HomeAssistantMqtt
         {
             await AnnounceServerAsync(CancellationToken.None).ConfigureAwait(false);
             await PublishServerStatsAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        // Announced outside the stats gate: emergency mode must reach HA even on
+        // a server with resource statistics switched off.
+        await AnnounceEmergencyAsync(CancellationToken.None).ConfigureAwait(false);
+    }
+
+    // ------------------------------------------------------------------ emergency mode
+
+    /// <summary>A camera sanitizing to "server" owns that topic space already, so
+    /// the switch would be published but never receive a command.</summary>
+    private bool ServerTopicTaken => _cameras.ContainsKey("server");
+
+    private async Task AnnounceEmergencyAsync(CancellationToken ct)
+    {
+        if (Emergency == null || !_cfg.Discovery) return;
+        if (ServerTopicTaken)
+        {
+            Log.Warn("MQTT: a camera is named 'server', which owns that topic space — " +
+                     "the Emergency mode switch is not published (rename the camera to get it)");
+            return;
+        }
+        var config = new
+        {
+            name = "Emergency mode",
+            unique_id = "neolink_server_emergency_mode",
+            state_topic = ServerTopic("emergency_mode"),
+            command_topic = $"{ServerTopic("emergency_mode")}/set",
+            payload_on = "ON",
+            payload_off = "OFF",
+            icon = "mdi:alarm-light",
+            device = ServerDevice(),
+            availability = new object[] { new { topic = _availabilityTopic } },
+            availability_mode = "all",
+        };
+        await PublishAsync($"{_cfg.DiscoveryPrefix}/switch/neolink_server/emergency_mode/config",
+            JsonSerializer.Serialize(config, DiscoveryJson), ct).ConfigureAwait(false);
+        await PublishEmergencyStateAsync(ct).ConfigureAwait(false);
+    }
+
+    private Task PublishEmergencyStateAsync(CancellationToken ct) =>
+        Emergency == null || ServerTopicTaken
+            ? Task.CompletedTask
+            : PublishAsync(ServerTopic("emergency_mode"),
+                Emergency.Snapshot().Enabled ? "ON" : "OFF", ct);
+
+    /// <summary>Re-publishes the emergency switch after a web-UI/API change.</summary>
+    public async Task RepublishEmergencyAsync()
+    {
+        try { await PublishEmergencyStateAsync(CancellationToken.None).ConfigureAwait(false); }
+        catch (Exception ex) { Log.Debug($"MQTT: emergency state publish failed: {Log.Flatten(ex)}"); }
+    }
+
+    private async Task HandleServerCommandAsync(string entity, string payload)
+    {
+        if (entity != "emergency_mode" || Emergency == null) return;
+        // Echo first: latching sirens on every camera takes seconds, and HA's
+        // optimistic toggle snaps back if the state does not land promptly. Its
+        // own try: a dropped publish must never cost the arm/disarm itself.
+        try
+        {
+            await PublishAsync(ServerTopic("emergency_mode"), payload == "ON" ? "ON" : "OFF",
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Debug($"MQTT: emergency echo failed: {Log.Flatten(ex)}");
+        }
+        try
+        {
+            await Emergency.SetEnabledAsync(payload == "ON", CancellationToken.None).ConfigureAwait(false);
+            await PublishEmergencyStateAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"MQTT: emergency mode command failed: {Log.Flatten(ex)}");
         }
     }
 
@@ -288,7 +369,14 @@ public sealed class HomeAssistantMqtt
         if (!topic.StartsWith(prefix, StringComparison.Ordinal)) return;
         var rest = topic[prefix.Length..].Split('/');
         if (rest.Length != 3 || rest[2] != "set") return;
-        if (!_cameras.TryGetValue(rest[0], out var cam)) return;
+        if (!_cameras.TryGetValue(rest[0], out var cam))
+        {
+            // Server-level entities live under "server"; a camera of that name
+            // was matched above and keeps the topic space it already owned.
+            if (rest[0] == "server")
+                _ = HandleServerCommandAsync(rest[1], System.Text.Encoding.UTF8.GetString(payload));
+            return;
+        }
         _ = cam.HandleCommandAsync(rest[1], System.Text.Encoding.UTF8.GetString(payload));
     }
 
@@ -498,6 +586,8 @@ public sealed class HomeAssistantMqtt
             try { await Task.Delay(RefreshInterval, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
             if (!_client.IsConnected) continue;
+            // Cheap: PublishAsync drops an unchanged retained payload.
+            await RepublishEmergencyAsync().ConfigureAwait(false);
             foreach (var cam in _cameras.Values)
             {
                 try { await cam.RefreshAsync(ct).ConfigureAwait(false); }
@@ -527,6 +617,9 @@ internal sealed class CameraBridge
     private readonly HashSet<string> _sensorOn = new();
 
     private bool _featuresAnnounced;
+    /// <summary>What the last announcement assumed about this camera's ability to
+    /// detect anything, so a change can be noticed and re-announced.</summary>
+    private bool _announcedEvents;
     private bool _doorbellAnnounced;
     private DateTime _lastDoorbellPress = DateTime.MinValue;
 
@@ -695,18 +788,37 @@ internal sealed class CameraBridge
             await PublishContinuousStateAsync(ct).ConfigureAwait(false);
         }
 
-        if (!_cam.SupportsEvents)
-        {
-            // Generic RTSP camera: no detection pushes and no Baichuan commands —
-            // motion sensors and a reboot button would be dead weight in HA. A
-            // connectivity sensor is the honest surface (and gives the device an
-            // entity, so it actually shows up).
+        // A non-Reolink camera gets a connectivity sensor whether or not it has
+        // detections: it is the one entity that always means something, and without
+        // it a camera with no events at all would not appear in HA as a device.
+        if (_control.OnvifOnly)
             await AnnounceEntityAsync("binary_sensor", "status", ConnectivityConfig(), ct).ConfigureAwait(false);
+
+        // Only where a reboot can actually be commanded: Baichuan always, a
+        // non-Reolink camera only through ONVIF. Independent of whether it can detect.
+        if (_control.CanReboot)
+            await AnnounceEntityAsync("button", "reboot", ButtonConfig("Reboot", "reboot", "restart"), ct).ConfigureAwait(false);
+
+        if (!_cam.EventsAvailableNow)
+        {
+            // No way to detect anything — a generic RTSP camera with no ONVIF event
+            // service, or none reachable. Motion sensors would be dead weight, but
+            // an on-demand clip needs no detection at all, and the web UI offers one.
+            if (_cam.EventRecorder is { } onDemand)
+            {
+                await AnnounceEntityAsync("switch", "record", RecordSwitchConfig(), ct).ConfigureAwait(false);
+                await _hub.PublishAsync(StateTopic("record"), onDemand.OnDemand != null ? "ON" : "OFF", ct)
+                    .ConfigureAwait(false);
+            }
             if (HasRecordingSensor) // continuous (24/7) recording can still run here
             {
                 await AnnounceEntityAsync("binary_sensor", "recording", RecordingSensorConfig(), ct).ConfigureAwait(false);
                 await PublishRecordingStateAsync(force: true).ConfigureAwait(false);
             }
+            // A camera without a working event service still has a picture, sliders,
+            // PTZ and presets: those are announced regardless.
+            if (_featuresAnnounced)
+                await AnnounceFeaturesAsync(ct).ConfigureAwait(false);
             return;
         }
 
@@ -716,7 +828,6 @@ internal sealed class CameraBridge
         var labels = HomeAssistantMqtt.DetectionLabels;
         foreach (var label in labels)
             await AnnounceEntityAsync("binary_sensor", label, BinarySensorConfig(label), ct).ConfigureAwait(false);
-        await AnnounceEntityAsync("button", "reboot", ButtonConfig("Reboot", "reboot", "restart"), ct).ConfigureAwait(false);
 
         // The Record switch: capture one clip on demand from HA — no camera
         // detection involved ("record while the door is open").
@@ -1119,8 +1230,12 @@ internal sealed class CameraBridge
     {
         identifiers = new[] { $"neolink_{Id}" },
         name = _cam.Name,
-        manufacturer = _cam.SupportsEvents ? "Reolink (via Neolink.NET)" : "Neolink.NET",
-        model = !_cam.SupportsEvents ? "Generic RTSP camera"
+        // Which KIND of camera this is, which is not the same question as whether it
+        // can detect anything: a non-Reolink camera with a working ONVIF event
+        // service has detections and is still not a Reolink.
+        manufacturer = _control.OnvifOnly ? "Neolink.NET" : "Reolink (via Neolink.NET)",
+        model = _control.OnvifOnly
+            ? string.IsNullOrEmpty(_model) ? "Generic RTSP camera" : $"{_model} (ONVIF)"
             : string.IsNullOrEmpty(_model) ? "Baichuan camera" : _model,
         sw_version = _hub.Version,
     };
@@ -1144,6 +1259,8 @@ internal sealed class CameraBridge
             "line-crossing" => "Line crossing",
             "intrusion" => "Intrusion",
             "loitering" => "Loitering",
+            "object-left" => "Object left",
+            "object-taken" => "Object taken",
             _ => label,
         },
         unique_id = $"neolink_{Id}_{label}",
@@ -1163,6 +1280,8 @@ internal sealed class CameraBridge
             "line-crossing" => "mdi:vector-line",
             "intrusion" => "mdi:shield-alert-outline",
             "loitering" => "mdi:account-clock-outline",
+            "object-left" => "mdi:bag-personal-outline",
+            "object-taken" => "mdi:bag-personal-off-outline",
             _ => (string?)null,
         },
         device = Device(),
@@ -1777,12 +1896,35 @@ internal sealed class CameraBridge
         // a camera can go offline mid-event and the OFF still has to land.
         await PublishRecordingStateAsync(force: false).ConfigureAwait(false);
         if (!_control.Online) return;
+        // A generic camera's reads go over ONVIF, which can be slow: they run beside the loop,
+        // one at a time, so the cameras after it (a Reolink's motion-off) are not held up.
+        if (_control is GenericCameraControl)
+        {
+            if (Interlocked.Exchange(ref _cameraRefreshing, 1) == 0)
+                _ = Task.Run(async () =>
+                {
+                    try { await RefreshFromCameraAsync(ct).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { }
+                    catch (Exception ex) { Log.Debug($"MQTT: refresh for '{Id}' failed: {Log.Flatten(ex)}"); }
+                    finally { Volatile.Write(ref _cameraRefreshing, 0); }
+                }, CancellationToken.None);
+            return;
+        }
+        await RefreshFromCameraAsync(ct).ConfigureAwait(false);
+    }
 
+    private int _cameraRefreshing;
+
+    /// <summary>The part of the refresh that asks the camera itself.</summary>
+    private async Task RefreshFromCameraAsync(CancellationToken ct)
+    {
         // First time online: probe capabilities, then announce the feature entities.
         if (!_featuresAnnounced)
         {
             var caps = await TryGetCapabilitiesAsync(ct).ConfigureAwait(false);
-            if (caps?.Features is { } f)
+            // A provisional answer (ONVIF not reached yet) must not be settled on: it
+            // would announce a camera with no picture, pan/tilt or sliders for good.
+            if (caps?.Features is { } f && !caps.Provisional)
             {
                 _model = caps.Version?.Model;
                 if (f.Led) await ProbeLedAsync(ct).ConfigureAwait(false);
@@ -1794,9 +1936,21 @@ internal sealed class CameraBridge
                 // volume/auto-track/preset/picture/quick-reply entities exist here.
                 await ProbeHttpExtrasAsync(f, ct).ConfigureAwait(false);
                 _featuresAnnounced = true;
+                _announcedEvents = _cam.EventsAvailableNow;
                 await AnnounceAsync(ct).ConfigureAwait(false);
                 await PublishHttpExtrasAsync(ct).ConfigureAwait(false);
             }
+        }
+        // A non-Reolink camera's detections are only known to exist once its ONVIF
+        // event subscription lands, which can be a moment AFTER it first came online
+        // and was announced. Without this the motion sensors would be missing until
+        // the next restart of the server.
+        else if (_announcedEvents != _cam.EventsAvailableNow)
+        {
+            _announcedEvents = _cam.EventsAvailableNow;
+            Log.Info($"{_cam.Name}: detections became {(_announcedEvents ? "available" : "unavailable")} — " +
+                     "re-announcing its Home Assistant entities");
+            await AnnounceAsync(ct).ConfigureAwait(false);
         }
 
         var caps2 = await TryGetCapabilitiesAsync(ct).ConfigureAwait(false);

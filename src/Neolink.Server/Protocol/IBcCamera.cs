@@ -29,7 +29,10 @@ public interface IBcCamera : IAsyncDisposable
     /// UID-only battery camera can be liveness-scanned by ping without waking it.</summary>
     System.Net.IPAddress? RemoteIp { get; }
 
-    Task LoginAsync(string username, string? password, CancellationToken ct);
+    /// <summary>Completes when the connection is dead (with the reason); any further request fails at once.</summary>
+    Task<string> Closed { get; }
+
+    Task LoginAsync(string username, string? password, CancellationToken ct, BcLoginMode? mode = null);
 
     /// <summary>
     /// Requests the video stream and pumps the raw binary sub-stream chunks into
@@ -60,6 +63,11 @@ public interface IBcCamera : IAsyncDisposable
 
     /// <summary>Requests a JPEG snapshot from the camera (msg 109), or null if unsupported.</summary>
     Task<byte[]?> SnapAsync(CancellationToken ct);
+
+    /// <summary>Downloads one SD-card file (msg 8, closed with msg 9) as BcMedia frames into
+    /// <paramref name="dest"/>; returns the bytes received. The listed size ends it; 0 = until the camera goes quiet.</summary>
+    Task<long> DownloadFileAsync(System.Xml.Linq.XElement request, long expectedBytes, Stream dest,
+        CancellationToken ct) => throw new NotSupportedException("this connection can't download SD files");
 
     /// <summary>
     /// Two-way talk: configures the camera's speaker for the given audio profile

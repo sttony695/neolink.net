@@ -53,7 +53,10 @@ public sealed record CameraRecordingSettings(bool Events, bool Continuous, List<
     bool EmailEvents = false,
     // Same opt-in for the webhook channel (Server settings → Notifications owns
     // the endpoint and format).
-    bool WebhookEvents = false)
+    bool WebhookEvents = false,
+    // Fetch the camera's own recording of each event from its SD card (the seconds
+    // before Neolink connected). Null = off.
+    bool? SdFill = null)
 {
     /// <summary>Known detection labels (what the UI offers as event-type filters).</summary>
     public static readonly string[] KnownLabels =
@@ -64,7 +67,7 @@ public sealed record CameraRecordingSettings(bool Events, bool Continuous, List<
         // Perimeter protection (line/zone crossing set up in the Reolink app):
         // record on these INSTEAD of the plain detections, no non-detection
         // zones needed — untick person/vehicle and keep these.
-        "line-crossing", "intrusion", "loitering",
+        "line-crossing", "intrusion", "loitering", "object-left", "object-taken",
         "motion",
     };
 
@@ -170,7 +173,10 @@ public sealed class RecordingSettings
                 if (loaded != null)
                     _cameras = new Dictionary<string, CameraRecordingSettings>(loaded, StringComparer.OrdinalIgnoreCase);
                 if (!ReferenceEquals(source, _file) && source != _file)
+                {
                     Save();
+                    CopyMigrationMarkers(Path.GetDirectoryName(source) ?? ".");
+                }
             }
         }
         catch (Exception ex)
@@ -191,6 +197,59 @@ public sealed class RecordingSettings
             };
             _cameras = next;
         }
+    }
+
+    /// <summary>The one-time migration that switches generic cameras' Detection
+    /// events on, now that they can detect (over ONVIF). See Program.</summary>
+    public const string OnvifEventsMigration = "onvif-events";
+
+    /// <summary>Whether a named one-time migration has not run yet on this state directory;
+    /// <see cref="CompleteMigration"/> records it in a marker file beside settings.json.</summary>
+    public bool MigrationDue(string name) => !File.Exists(MigrationMarker(name));
+
+    public void CompleteMigration(string name)
+    {
+        if (!MigrationDue(name)) return;
+        try { File.WriteAllText(MigrationMarker(name), DateTime.UtcNow.ToString("O")); }
+        catch (Exception ex) { Log.Warn($"Cannot record the '{name}' settings migration: {ex.Message}"); }
+    }
+
+    private string MigrationMarker(string name) =>
+        Path.Combine(Path.GetDirectoryName(_file) ?? ".", $"settings.migrated-{name}");
+
+    /// <summary>Brings the migration markers along with a settings.json moved from <paramref name="fromDir"/>.</summary>
+    private void CopyMigrationMarkers(string fromDir)
+    {
+        try
+        {
+            foreach (var marker in Directory.EnumerateFiles(fromDir, "settings.migrated-*"))
+            {
+                var to = Path.Combine(Path.GetDirectoryName(_file) ?? ".", Path.GetFileName(marker));
+                if (!File.Exists(to)) File.Copy(marker, to);
+            }
+        }
+        catch (Exception ex) { Log.Warn($"Cannot carry the settings migration markers over: {ex.Message}"); }
+    }
+
+    /// <summary>Sets a camera's Detection events switch to <paramref name="eventsDefault"/> when
+    /// the stored value differs. For a migration: the stored value was never the user's choice.</summary>
+    public void ResetEvents(string camera, bool eventsDefault)
+    {
+        bool changed;
+        lock (_gate)
+        {
+            if (!_cameras.TryGetValue(camera, out var cur) || cur.Events == eventsDefault) return;
+            _cameras = new Dictionary<string, CameraRecordingSettings>(_cameras, StringComparer.OrdinalIgnoreCase)
+            {
+                [camera] = cur with { Events = eventsDefault },
+            };
+            changed = true;
+        }
+        if (!changed) return;
+        Log.Info($"{camera}: Detection events switched {(eventsDefault ? "on" : "off")} — this camera can now " +
+                 "detect over ONVIF, and the stored setting predates that (turn it off in the camera's " +
+                 "Recording tab if that is not wanted)");
+        Save();
     }
 
     public CameraRecordingSettings Get(string camera) =>
@@ -215,7 +274,8 @@ public sealed class RecordingSettings
         int? archiveRetentionDays = null, bool setArchiveRetention = false,
         bool? wakeTimeline = null, bool? aiDescribe = null,
         string? aiContext = null, bool setAiContext = false,
-        bool? emailEvents = null, bool? webhookEvents = null)
+        bool? emailEvents = null, bool? webhookEvents = null,
+        bool? sdFill = null, bool setSdFill = false)
     {
         CameraRecordingSettings next;
         lock (_gate)
@@ -239,7 +299,8 @@ public sealed class RecordingSettings
                 aiDescribe ?? cur.AiDescribe,
                 setAiContext ? aiContext : cur.AiContext,
                 emailEvents ?? cur.EmailEvents,
-                webhookEvents ?? cur.WebhookEvents);
+                webhookEvents ?? cur.WebhookEvents,
+                setSdFill ? sdFill : cur.SdFill);
             _cameras = new Dictionary<string, CameraRecordingSettings>(_cameras, StringComparer.OrdinalIgnoreCase)
             {
                 [camera] = next,

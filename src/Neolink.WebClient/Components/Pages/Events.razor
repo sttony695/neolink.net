@@ -1,4 +1,4 @@
-@page "/events"
+﻿@page "/events"
 @page "/events/{Camera}"
 @using System.Text.Json
 @inject HttpClient Http
@@ -6,6 +6,7 @@
 @inject NavigationManager Nav
 @inject LocalApiInfo Local
 @inject Translator T
+@inject DetectZones DetectZones
 @implements IAsyncDisposable
 
 @* Dedicated events page — the landing target for "motion detected" push
@@ -13,7 +14,7 @@
    A recent-events list on the left, the selected clip on the right (stacked on
    phones), and a one-tap jump to that camera's live feed. *@
 
-<PageTitle>@T["Neolink.NET — Events"]</PageTitle>
+<PageTitle>@T["Neolink.NET · Events"]</PageTitle>
 
 <div class="ev-page @((_sdMode ? _sdSelected != null : _selected != null) ? "has-selection" : "")">
     <div class="toolbar ev-toolbar">
@@ -37,8 +38,8 @@
                     title="@T["Events this server recorded"]"
                     @onclick="() => SetSdModeAsync(false)">@T["Server"]</button>
             <button class="ev-switch-opt @(_sdMode ? "active" : "")" role="tab" aria-selected="@_sdMode"
-                    title="@T["Recordings stored on the camera's own SD card — including footage from while this server was off"]"
-                    @onclick="() => SetSdModeAsync(true)">@T["SD card"] <span class="preview-tag">@T["PREVIEW"]</span></button>
+                    title="@T["Recordings stored on the camera's own SD card, including footage from while this server was off"]"
+                    @onclick="() => SetSdModeAsync(true)">@T["SD card"] <span class="beta-tag">@T["BETA"]</span></button>
         </span>
 
         @if (!_sdMode)
@@ -70,7 +71,7 @@
                 }
             </span>
             <button class="chip @(_unreviewedOnly ? "chip-active" : "chip-off")"
-                    title="@(_unreviewedOnly ? T["Showing only events you haven't opened yet — click to show all"] : T["Show only events you haven't opened yet"])"
+                    title="@(_unreviewedOnly ? T["Showing only events you haven't opened yet (click to show all)"] : T["Show only events you haven't opened yet"])"
                     @onclick="() => { _unreviewedOnly = !_unreviewedOnly; ResetPaging(); }">@T["unreviewed only"]</button>
             @if (AnyAiLevels)
             {
@@ -104,19 +105,29 @@
                     }
                 </span>
             }
-            <span class="tool-label">@T["DAY"]</span>
+            <span class="tool-label">@T["FROM"]</span>
             <input class="event-filter event-date-input" type="date"
-                   title="@T["Show one day's events (blank = the rolling last 24 hours)"]"
+                   title="@T["First day to show (blank = as far back as the events go)"]"
                    max="@DateTime.Today.ToString("yyyy-MM-dd")"
-                   value="@(_date?.ToString("yyyy-MM-dd") ?? "")"
-                   @onchange="e => SetDateAsync((string?)e.Value)" />
-            @if (_date != null)
+                   value="@(_from?.ToString("yyyy-MM-dd") ?? "")"
+                   @onchange="e => SetRangeAsync((string?)e.Value, null)" />
+            <span class="tool-label">@T["TO"]</span>
+            <input class="event-filter event-date-input" type="date"
+                   title="@T["Last day to show (blank = up to now)"]"
+                   max="@DateTime.Today.ToString("yyyy-MM-dd")"
+                   value="@(_to?.ToString("yyyy-MM-dd") ?? "")"
+                   @onchange="e => SetRangeAsync(null, (string?)e.Value)" />
+            @if (Dated)
             {
-                <button class="chip" title="@T["Back to the rolling last 24 hours"]" @onclick="() => SetDateAsync(null)">↺ 24h</button>
+                <button class="chip" title="@T["Back to the rolling last 24 hours"]" @onclick="ClearRangeAsync">↺ 24h</button>
             }
             <button class="chip @(_selectMode ? "chip-active" : "")"
                     title="@(_selectMode ? T["Leave selection mode without deleting"] : T["Pick multiple events to delete at once"])"
                     @onclick="ToggleSelectModeAsync">@UiIcon.Render("trash", 13) @T["Delete…"]</button>
+            @* The sparkle only once a model is configured; a magnifier otherwise. *@
+            <button class="chip ev-adv-btn @(_searchResults != null ? "chip-active" : "")"
+                    title="@(_searchAi ? T["AI search is on: complex phrases use your local AI"] : T["AI is not configured: structured search only (type, camera, date)"])"
+                    @onclick="OpenAdvancedAsync">@UiIcon.Render(_searchAi ? "sparkles" : "zoom", 13) @T["Advanced search"]</button>
         }
         else
         {
@@ -130,7 +141,7 @@
             </select>
             <span class="tool-label">@T["DAY"]</span>
             <input class="event-filter event-date-input" type="date"
-                   title="@T["Day to list from the camera's SD card — days with footage are offered as chips in the list"]"
+                   title="@T["Day to list from the camera's SD card; days with footage are offered as chips in the list"]"
                    max="@DateTime.Today.ToString("yyyy-MM-dd")"
                    value="@_sdDate.ToString("yyyy-MM-dd")"
                    @onchange="e => SetSdDateAsync((string?)e.Value)" />
@@ -142,68 +153,31 @@
         <button class="icon-btn" title="@T["Refresh"]" @onclick="RefreshCurrentAsync">@UiIcon.Render("refresh", 14)</button>
     </div>
 
-    @if (!_sdMode)
+    @if (!_sdMode && _searchResults != null)
     {
-        <div class="ev-search-row">
-        <div class="ev-search-head">
-            <span class="ev-search-title">@T["AI Search"]</span>
-            <span class="beta-tag">@T["BETA"]</span>
-        </div>
-        <div class="ev-search">
-            <span class="ev-search-icon @(_searchAi ? "ai" : "")"
-                  title="@(_searchAi ? T["AI search is on — complex phrases use your local AI"] : T["AI is not configured — structured search only (type, camera, date)"])">
-                @UiIcon.Render(_searchAi ? "sparkles" : "zoom", 15)
-            </span>
-            <span class="ev-search-box">
-                <input class="ev-search-input" placeholder="@T["Search events — try: person in FrontDoor yesterday"]"
-                       @bind="_searchQ" @bind:event="oninput" @onkeydown="OnSearchKeyAsync" />
-                @if (!_searchBusy && (_searchQ.Length > 0 || _searchResults != null))
-                {
-                    <button class="ev-search-clear" title="@T["Clear"]" @onclick="ClearSearch">@UiIcon.Render("x", 13)</button>
-                }
-            </span>
-            <button class="chip chip-active" disabled="@_searchBusy" @onclick="RunSearchAsync">@T["Search"]</button>
-            @if (_searchBusy)
+        @* The search owns the list until cleared; this strip says what it asked. *@
+        <div class="ev-search-info">
+            <span class="ev-search-q" title="@_searchQ">@UiIcon.Render(_searchUsedAi ? "sparkles" : "zoom", 12) “@_searchQ”</span>
+            <span>@T["Understood as:"]</span>
+            <span class="ev-search-chips">@_searchSummary</span>
+            @if (_searchUsedAi)
             {
-                <span class="btn-spinner"></span>
+                <span class="ev-search-ai">@T["refined by AI"]</span>
             }
+            <span class="event-day-count">@_searchResults.Count</span>
+            <span class="tile-spacer"></span>
+            <button class="chip" title="@T["Change the question, period or filters"]" @onclick="OpenAdvancedAsync">@T["Edit"]</button>
+            <button class="chip" title="@T["Back to the event list"]" @onclick="ClearSearch">@UiIcon.Render("x", 12) @T["Clear"]</button>
         </div>
-        </div>
-        @if (_searchResults == null && !_searchBusy)
+        @if (_searchKwMiss)
         {
-            <div class="ev-search-hint">
-                @T["Search in plain language — event type, camera, time and what happened."]
-                @if (!_searchAi)
-                {
-                    <text> </text>@T["Configure a local AI model in the AI settings to unlock description-based matching."]
-                }
-            </div>
+            <div class="notice ev-search-miss">@(_searchJudged
+                ? T.F("The AI reviewed that period but nothing matches {0}; showing everything the other filters allow.", "“" + _searchKwText + "”")
+                : T.F("No event description mentions {0}; showing everything the other filters allow.", "“" + _searchKwText + "”"))</div>
         }
-        @if (_searchError && !_searchBusy)
+        else if (_searchKwPartial)
         {
-            <div class="notice ev-search-miss">@T["The search took too long or failed — try again, or narrow the period."]</div>
-        }
-        @if (_searchResults != null)
-        {
-            <div class="ev-search-info">
-                <span>@T["Understood as:"]</span>
-                <span class="ev-search-chips">@_searchSummary</span>
-                @if (_searchUsedAi)
-                {
-                    <span class="ev-search-ai">@UiIcon.Render("sparkles", 12) @T["refined by AI"]</span>
-                }
-                <span class="event-day-count">@_searchResults.Count</span>
-            </div>
-            @if (_searchKwMiss)
-            {
-                <div class="notice ev-search-miss">@(_searchJudged
-                    ? T.F("The AI reviewed that period but nothing matches {0} — showing everything the other filters allow.", "“" + _searchKwText + "”")
-                    : T.F("No event description mentions {0} — showing everything the other filters allow.", "“" + _searchKwText + "”"))</div>
-            }
-            else if (_searchKwPartial)
-            {
-                <div class="notice ev-search-miss">@T.F("No event description mentions all of {0} — showing the closest matches.", "“" + _searchKwText + "”")</div>
-            }
+            <div class="notice ev-search-miss">@T.F("No event description mentions all of {0}; showing the closest matches.", "“" + _searchKwText + "”")</div>
         }
     }
 
@@ -244,7 +218,7 @@
                     @if (_sdDays.Count > 0)
                     {
                         <div class="ev-day">
-                            <div class="ev-day-head">@T.F("{0} — DAYS WITH RECORDINGS", $"{T.Month(_sdDate.Month)} {_sdDate.Year}".ToUpperInvariant())</div>
+                            <div class="ev-day-head">@T.F("{0} · DAYS WITH RECORDINGS", $"{T.Month(_sdDate.Month)} {_sdDate.Year}".ToUpperInvariant())</div>
                             <div class="stream-options sd-day-chips">
                                 @foreach (var d in _sdDays)
                                 {
@@ -277,7 +251,7 @@
                         </div>
                     }
                     <div class="notice small">
-                        @((MarkupString)T["Recorded by the <b>camera itself</b> onto its SD card — including anything from while this server was off. Playback streams straight from the camera, so loading can be slow (especially over Wi-Fi)."])
+                        @((MarkupString)T["Recorded by the <b>camera itself</b> onto its SD card, including anything from while this server was off. Playback streams straight from the camera, so loading can be slow (especially over Wi-Fi)."])
                     </div>
                 }
             </div>
@@ -288,7 +262,7 @@
                     <div class="event-player-head">
                         <button class="icon-btn ev-back" title="@T["Back to the list"]" @onclick="() => _sdSelected = null">@UiIcon.Render("chev-left", 16)</button>
                         <div class="event-player-title">
-                            <span class="event-title">@_sdCamera — @sr.TimeLabel</span>
+                            <span class="event-title">@_sdCamera · @sr.TimeLabel</span>
                             <span class="event-sub">@T.DateShort(sr.Start) · @sr.DurationLabel · @sr.SizeLabel</span>
                         </div>
                         <a class="chip" href="@SdUrl(sr, dl: true)" title="@T["Save this recording as a file"]">
@@ -296,12 +270,68 @@
                         </a>
                     </div>
                     @* zoom-on: SD-card playback gets the same digital zoom as live views. *@
-                    <div class="event-player-media zoom-on" @key="sr.File">
+                    <div class="event-player-media zoom-on" id="ev-player-media" @key="sr.File">
                         <video id="ev-video" controls autoplay="@_autoplay" playsinline></video>
                         @ZoomHud
+                        <div class="cam-rail" @onclick:stopPropagation="true" @ondblclick:stopPropagation="true">
+                            <div class="cam-rail-pill">
+                                @if (DetectSurface() != null)
+                                {
+                                    <button class="cam-rail-btn @(_boxes ? "rail-active" : "")"
+                                            title="@(_boxes ? T["Hide the object boxes"] : T["Outline people, vehicles and animals"])"
+                                            @onclick="ToggleBoxesAsync">@UiIcon.Render("boxes", 14)</button>
+                                }
+                                <button class="cam-rail-btn" title="@T["Browser fullscreen (click again to exit)"]"
+                                        @onclick='() => JS.InvokeVoidAsync("neolink.fullscreen", "ev-player-media")'>
+                                    <span class="fs-enter">@UiIcon.Render("fs-enter", 14)</span><span class="fs-exit">@UiIcon.Render("fs-exit", 14)</span>
+                                </button>
+                            </div>
+                        </div>
                     </div>
+                    <div class="player-speed">
+                        <span class="player-group" title="@T["Playback speed"]">
+                            @foreach (var s in Speeds)
+                            {
+                                <button class="chip @(_speed == s ? "chip-active" : "")" disabled="@(_sdPartial && s > 1)"
+                                        title="@(_sdPartial && s > 1 ? T["Faster playback once the whole clip has arrived"] : "")"
+                                        @onclick="() => SetSpeedAsync(s)">@FormatSpeed(s)</button>
+                            }
+                        </span>
+                        @* Hidden once a day's search shows the camera keeps no copy in the other quality. *@
+                        @if (!SdOtherQualityAbsent(sr))
+                        {
+                            <span class="player-div" aria-hidden="true">|</span>
+                            <span class="player-group" title="@T["Recording quality"]">
+                                <button class="chip @(_sdSub ? "" : "chip-active")" title="@T["Full-quality main-stream recording"]"
+                                        @onclick="() => SetSdQualityAsync(sub: false)">HD</button>
+                                <button class="chip @(_sdSub ? "chip-active" : "")"
+                                        title="@T["Low-res sub-stream recording from the card, when the camera kept one"]"
+                                        @onclick="() => SetSdQualityAsync(sub: true)">SD</button>
+                            </span>
+                        }
+                    </div>
+                    @if (_sdNote != null)
+                    {
+                        <div class="notice small">@_sdNote</div>
+                    }
                     <div class="notice small">
-                        @T["The recording is fetched from the camera first — starting can take a few seconds (longer over Wi-Fi); once playing, scrubbing works normally."]
+                        @T["The recording is fetched from the camera first; starting can take a few seconds (longer over Wi-Fi); once playing, scrubbing works normally."]
+                    </div>
+                    @* Encrypted recordings (Video Doorbell, Elite): the camera decrypts once
+                       it has the password, which goes to the server in a POST body only. *@
+                    <div class="control-row row-inline">
+                        @if (!_sdUnlockOpen)
+                        {
+                            <button class="chip" title="@T["For cameras set to encrypt their SD recordings"]"
+                                    @onclick="() => _sdUnlockOpen = true">@UiIcon.Render("lock", 13) @T["Encrypted recording?"]</button>
+                        }
+                        else
+                        {
+                            <input class="ret-input" type="password" autocomplete="off"
+                                   placeholder="@T["recording password"]" @bind="_sdUnlockPassword" />
+                            <button class="chip" disabled="@string.IsNullOrEmpty(_sdUnlockPassword)"
+                                    @onclick="UnlockSdAsync">@T["Unlock"]</button>
+                        }
                     </div>
                 }
                 else
@@ -321,7 +351,7 @@
     else if (!_supported)
     {
         <div class="notice">
-            @T["Recording is not enabled on this server — add a 'recording' section to the config to capture events."]
+            @T["Recording is not enabled on this server; add a 'recording' section to the config to capture events."]
         </div>
     }
     else
@@ -342,8 +372,8 @@
                 {
                     <div class="notice">
                         @(_hiddenLevels.Count > 0 ? T["No events match the threat filter."]
-                            : _unreviewedOnly ? T["Nothing awaiting review — all clear."]
-                            : _date != null ? T["No events on this day."]
+                            : _unreviewedOnly ? T["Nothing awaiting review; all clear."]
+                            : Dated ? T["No events in this range."]
                             : T["No events in the last 24 hours."])
                     </div>
                 }
@@ -370,7 +400,7 @@
                                     }
                                     else
                                     {
-                                        <span class="event-thumb-icon">@ev.Icon</span>
+                                        <span class="event-thumb-icon">@UiIcon.Render(ev.IconName, 28)</span>
                                     }
                                     <span class="event-row-dur">@DurationText(ev)</span>
                                     @if (ev.Ongoing)
@@ -380,13 +410,13 @@
                                 </div>
                                 <div class="event-row-main">
                                     <span class="event-title">
-                                        @ev.Icon @EventTitle(ev)
+                                        @UiIcon.Render(ev.IconName, 14) @EventTitle(ev)
                                         @if (ev.AiLevel != null)
                                         {
                                             @* The AI threat verdict at a glance; cameras without AI
                                                descriptions simply have no dot. *@
                                             <span class="ai-dot ai-@ev.AiLevel"
-                                                  title="@(T.F("AI threat level: {0}", ev.AiLevel.ToUpperInvariant()) + (ev.AiDescription == null ? "" : " — " + ev.AiDescription))"></span>
+                                                  title="@(T.F("AI threat level: {0}", ev.AiLevel.ToUpperInvariant()) + (ev.AiDescription == null ? "" : ": " + ev.AiDescription))"></span>
                                         }
                                     </span>
                                     <span class="event-sub">@ev.Camera · @ev.Start.ToLocalTime().ToString("HH:mm:ss") · @Ago(ev.Start)</span>
@@ -407,7 +437,7 @@
                 }
                 else if (filtered.Count > PageSize)
                 {
-                    <div class="ev-end">@T.F("That's all — {0} event(s)", filtered.Count)</div>
+                    <div class="ev-end">@T.F("That's all: {0} event(s)", filtered.Count)</div>
                 }
             </div>
 
@@ -417,7 +447,7 @@
                     <div class="event-player-head">
                         <button class="icon-btn ev-back" title="@T["Back to the list"]" @onclick="CloseAsync">@UiIcon.Render("chev-left", 16)</button>
                         <div class="event-player-title">
-                            <span class="event-title">@sel.Icon @EventTitle(sel)</span>
+                            <span class="event-title">@UiIcon.Render(sel.IconName, 16) @EventTitle(sel)</span>
                             <span class="event-sub">@sel.Camera · @T.DateShort(sel.Start.ToLocalTime()) @sel.Start.ToLocalTime().ToString("HH:mm:ss") ·
                                 @if (sel.Ongoing)
                                 {
@@ -429,9 +459,10 @@
                                 }
                             </span>
                         </div>
-                        @if (sel.HasClip && !sel.Ongoing)
+                        @if ((sel.HasClip || sel.HasCameraClip) && !sel.Ongoing)
                         {
-                            <a class="chip" href="@(Artifact(sel, "clip") + "&dl=1")"
+                            @* Saves whichever copy is playing: the camera's own, or Neolink's. *@
+                            <a class="chip" href="@(Artifact(sel, sel.HasCameraClip && _cameraCopy ? "camera" : "clip") + "&dl=1")"
                                title="@T["Save this recording as a file"]">
                                 @UiIcon.Render("download", 13) @T["Download"]
                             </a>
@@ -441,6 +472,19 @@
                         </a>
                     </div>
 
+                    @if (sel.AiObjects is { Count: > 0 } seen)
+                    {
+                        @* What the model says was IN the frames. Each one searches for
+                           itself: reading "ladder" and wanting every other time a
+                           ladder turned up is the same thought. *@
+                        <div class="event-objects">
+                            @foreach (var thing in seen)
+                            {
+                                <button class="chip event-object" title="@T.F("Find other events with {0}", thing)"
+                                        @onclick="() => SearchForAsync(thing)">@thing</button>
+                            }
+                        </div>
+                    }
                     @if (sel.AiDescription != null || sel.AiLevel != null)
                     {
                         @* What the LLM saw (AI event descriptions) — only rendered for
@@ -465,38 +509,74 @@
                     else if (sel.AiPending)
                     {
                         <div class="event-ai ai-none">
-                            <span class="event-ai-text event-ai-pending">🧠 @T["AI is describing this event — refresh in a moment to see the text…"]</span>
+                            <span class="event-ai-text event-ai-pending">🧠 @T["AI is describing this event; refresh in a moment to see the text…"]</span>
                         </div>
                     }
-
-                    @if (sel.HasClip)
+                    @if (sel.HasClip || sel.HasCameraClip)
                     {
                         @* zoom-on: the recorded clip gets the same digital zoom as live
                            views — wheel/pinch to zoom, drag to pan, HUD buttons at the side. *@
-                        <div class="event-player-media zoom-on" @key="sel.Id">
+                        <div class="event-player-media zoom-on" id="ev-player-media" @key="sel.Id">
                             <video id="ev-video" controls autoplay="@_autoplay" playsinline></video>
                             @ZoomHud
+                            <div class="cam-rail" @onclick:stopPropagation="true" @ondblclick:stopPropagation="true">
+                                <div class="cam-rail-pill">
+                                    @if (DetectSurface() != null)
+                                    {
+                                        <button class="cam-rail-btn @(_boxes ? "rail-active" : "")"
+                                                title="@(_boxes ? T["Hide the object boxes"] : T["Outline people, vehicles and animals"])"
+                                                @onclick="ToggleBoxesAsync">@UiIcon.Render("boxes", 14)</button>
+                                    }
+                                    <button class="cam-rail-btn" title="@T["Browser fullscreen (click again to exit)"]"
+                                            @onclick='() => JS.InvokeVoidAsync("neolink.fullscreen", "ev-player-media")'>
+                                        <span class="fs-enter">@UiIcon.Render("fs-enter", 14)</span><span class="fs-exit">@UiIcon.Render("fs-exit", 14)</span>
+                                    </button>
+                                </div>
+                            </div>
                         </div>
+                        @* One row, always: the chips carry their own meaning, so the
+                           SPEED/QUALITY headings only cost the width that pushed the
+                           two groups onto separate lines on a phone. *@
                         <div class="player-speed">
-                            <span class="tool-label">@T["SPEED"]</span>
-                            @foreach (var s in Speeds)
+                            <span class="player-group" title="@T["Playback speed"]">
+                                @foreach (var s in Speeds)
+                                {
+                                    <button class="chip @(_speed == s ? "chip-active" : "")" @onclick="() => SetSpeedAsync(s)">@FormatSpeed(s)</button>
+                                }
+                            </span>
+                            @if (sel.HasCameraClip || sel.HasPreview)
                             {
-                                <button class="chip @(_speed == s ? "chip-active" : "")" @onclick="() => SetSpeedAsync(s)">@FormatSpeed(s)</button>
-                            }
-                            @if (sel.HasPreview)
-                            {
-                                <span class="tool-label player-quality-label">@T["QUALITY"]</span>
-                                <button class="chip @(_sd ? "" : "chip-active")" title="@T["Full-quality main-stream recording"]"
-                                        @onclick="() => SetStreamAsync(sd: false)">HD</button>
-                                <button class="chip @(_sd ? "chip-active" : "")"
-                                        title="@T["Low-res sub-stream recording — smoother fast-forward on slow storage"]"
-                                        @onclick="() => SetStreamAsync(sd: true)">SD</button>
+                                <span class="player-div" aria-hidden="true">|</span>
+                                <span class="player-group" title="@T["Recording quality"]">
+                                    @if (sel.HasCameraClip)
+                                    {
+                                        <button class="chip @(_cameraCopy ? "chip-active" : "")"
+                                                title="@T["The camera's own recording, fetched from its SD card; it starts at the camera's trigger"]"
+                                                @onclick="() => SetCameraCopyAsync(true)">@T["Camera"]</button>
+                                    }
+                                    <button class="chip @(!_cameraCopy && !_sd ? "chip-active" : "")" title="@T["Full-quality main-stream recording"]"
+                                            @onclick="async () => { _cameraCopy = false; await SetStreamAsync(sd: false); }">HD</button>
+                                    @if (sel.HasPreview)
+                                    {
+                                        <button class="chip @(!_cameraCopy && _sd ? "chip-active" : "")"
+                                                title="@T["Low-res sub-stream recording: smoother fast-forward on slow storage"]"
+                                                @onclick="async () => { _cameraCopy = false; await SetStreamAsync(sd: true); }">SD</button>
+                                    }
+                                </span>
                             }
                         </div>
+                        @if (sel.HasCameraClip && _cameraCopy && sel.CameraClipStart is { } camStart)
+                        {
+                            var lead = (sel.Start - camStart).TotalSeconds;
+                            <div class="event-sub">
+                                @(lead >= 1 ? T.F("The camera's own recording, from its SD card; it starts {0} s before Neolink's.", Math.Round(lead))
+                                            : T["The camera's own recording, from its SD card."])
+                            </div>
+                        }
                     }
                     else
                     {
-                        <div class="notice">@(sel.Ongoing ? T["No clip was recorded for this event yet — it is still being captured."] : T["No clip was recorded for this event."])</div>
+                        <div class="notice">@(sel.Ongoing ? T["No clip was recorded for this event yet; it is still being captured."] : T["No clip was recorded for this event."])</div>
                     }
 
                     <div class="event-player-foot">
@@ -520,6 +600,97 @@
                         <span>@T["Select an event to play it"]</span>
                     </div>
                 }
+            </div>
+        </div>
+    }
+
+    @if (_advOpen)
+    {
+        @* Advanced search: the question plus the period and filters it runs
+           within. Those bound the server's candidate pool, so the model (when
+           one is configured) reads only that slice. *@
+        <div class="ev-del-backdrop" @onclick="CloseAdvanced">
+            <div class="ev-del-dialog ev-adv-dialog" role="dialog" aria-label="@T["Advanced search"]"
+                 @onclick:stopPropagation="true" @onkeydown="OnAdvKeyAsync">
+                <div class="ev-del-title ev-adv-title">
+                    <span>@UiIcon.Render(_searchAi ? "sparkles" : "zoom", 15) @T["ADVANCED SEARCH"]</span>
+                    <button class="icon-btn" title="@T["Cancel"]" @onclick="CloseAdvanced">✕</button>
+                </div>
+                <input id="ev-adv-q" class="ev-search-input ev-adv-q" placeholder="@T["Search events (try: person in FrontDoor yesterday)"]"
+                       value="@_searchQ" @oninput="e => _searchQ = (string?)e.Value ?? string.Empty" disabled="@_searchBusy" />
+                <div class="ev-adv-hint">
+                    @T["Search in plain language: event type, camera, time and what happened."]
+                    @if (!_searchAi)
+                    {
+                        @(" ")@T["Configure a local AI model in the AI settings to unlock description-based matching."]
+                    }
+                </div>
+                <div class="ev-adv-section">@T["PERIOD"]</div>
+                <div class="ev-adv-row">
+                    <span class="tool-label">@T["FROM"]</span>
+                    <input class="event-filter event-date-input" type="date"
+                           max="@DateTime.Today.ToString("yyyy-MM-dd")"
+                           value="@(_advFrom?.ToString("yyyy-MM-dd") ?? "")"
+                           @onchange="e => SetAdvRange((string?)e.Value, null)" />
+                    <span class="tool-label">@T["TO"]</span>
+                    <input class="event-filter event-date-input" type="date"
+                           max="@DateTime.Today.ToString("yyyy-MM-dd")"
+                           value="@(_advTo?.ToString("yyyy-MM-dd") ?? "")"
+                           @onchange="e => SetAdvRange(null, (string?)e.Value)" />
+                    <button class="chip @(AdvDated ? "chip-off" : "chip-active")" title="@T["Search the rolling last 24 hours"]"
+                            @onclick="() => { _advFrom = _advTo = null; }">↺ 24h</button>
+                </div>
+                @if (AdvWideDays is { } wide)
+                {
+                    <div class="notice ev-search-miss ev-adv-warn">
+                        @(wide == 0
+                            ? T["No first day: every stored event is read. Set one for a faster answer."]
+                            : T.F("{0} days is a wide period; every event in it is read. Narrow it for a faster answer.", wide))
+                    </div>
+                }
+                <div class="ev-adv-section">@T["CAMERAS"]</div>
+                <div class="ev-adv-chips">
+                    <button class="chip @(_advCams.Count == 0 ? "chip-active" : "chip-off")"
+                            @onclick="() => _advCams.Clear()">@T["all cameras"]</button>
+                    @foreach (var c in _cameras)
+                    {
+                        var name = c.Name;
+                        <button class="chip @(_advCams.Contains(name) ? "chip-active" : "chip-off")"
+                                @onclick="() => ToggleAdvCam(name)">@name</button>
+                    }
+                </div>
+                <div class="ev-adv-section">@T["FILTERS"]</div>
+                <div class="ev-adv-chips">
+                    <button class="chip @(_advUnreviewed ? "chip-active" : "chip-off")"
+                            @onclick="() => _advUnreviewed = !_advUnreviewed">@T["unreviewed only"]</button>
+                    @if (AnyAiLevels)
+                    {
+                        @foreach (var lvl in ThreatLevels)
+                        {
+                            var l = lvl;
+                            <button class="chip @(_advHiddenLevels.Contains(l) ? "chip-off" : "chip-active")"
+                                    @onclick="() => ToggleAdvLevel(l)">@T[l]</button>
+                        }
+                    }
+                </div>
+                @if (_searchError && !_searchBusy)
+                {
+                    <div class="notice ev-search-miss">@T["The search took too long or failed; try again, or narrow the period."]</div>
+                }
+                <div class="ev-del-actions">
+                    <button class="chip" @onclick="CloseAdvanced">@T["Cancel"]</button>
+                    <button class="chip ev-adv-go" disabled="@(_searchBusy || _searchQ.Trim().Length < SearchMinChars)"
+                            @onclick="RunSearchAsync">
+                        @if (_searchBusy)
+                        {
+                            <span class="btn-spinner"></span><span>@T["Searching…"]</span>
+                        }
+                        else
+                        {
+                            <span>@UiIcon.Render(_searchAi ? "sparkles" : "zoom", 13) @T["Search"]</span>
+                        }
+                    </button>
+                </div>
             </div>
         </div>
     }
@@ -570,7 +741,7 @@
                                     : T.F("{0} selected events are still recording and will be kept.", _delSkipped))
                             </p>
                         }
-                        <p class="ev-del-warn">@T["This cannot be undone — the clips, thumbnails and previews are removed from disk."]</p>
+                        <p class="ev-del-warn">@T["This cannot be undone; the clips, thumbnails and previews are removed from disk."]</p>
                     </div>
                 }
                 <div class="ev-del-actions">
@@ -609,7 +780,13 @@
 
     private string _cameraFilter = "";
     private bool _unreviewedOnly;
-    private DateTime? _date;
+    /// <summary>The listed range, inclusive and in local days. Both null is the
+    /// rolling last 24 hours; either one set pivots the list onto stored days.
+    /// A single day is the range where both ends are the same, so "one day" and
+    /// "a week" are not two different modes.</summary>
+    private DateTime? _from;
+    private DateTime? _to;
+    private bool Dated => _from != null || _to != null;
     private bool _supported = true;
     private bool _loading = true;
     private string? _error;
@@ -643,6 +820,8 @@
     private List<ApiSdRecording> _sdRecs = new();    // the selected day's recordings
     private ApiSdRecording? _sdSelected;
     private bool _sdLoading;
+    private bool _sdUnlockOpen;
+    private string _sdUnlockPassword = "";
     private string? _sdError;
 
     /// <summary>The user's HD/SD pick: false = full main-stream clip (default at
@@ -706,8 +885,11 @@
             if (!string.IsNullOrWhiteSpace(Camera))
                 _cameraFilter = Camera;
 
+            try { _boxes = await JS.InvokeAsync<string?>("neolink.lsGet", "neolink.boxes") != "0"; } catch { }
+
             await LoadCamPrefsAsync();
             await LoadCamerasAsync();
+            _detect = await GetJsonAsync<ApiDetect>("/api/detect");
             await LoadSearchInfoAsync();
             await RefreshAsync();
 
@@ -743,9 +925,11 @@
         if (_pendingVideoUrl is { } url)
         {
             _pendingVideoUrl = null;
-            await JS.InvokeVoidAsync("neolink.eventPlayer", "ev-video", url, _speed,
+            await JS.InvokeVoidAsync("neolink.eventPlayer", "ev-video", url, _sdMode && _sdPartial ? 1 : _speed,
                 _selected is { } fb ? PlayerFallback(fb) : null, _autoplay, _selected?.Ongoing == true);
         }
+
+        await SyncDetectAsync();
 
         // (Re)attach the load-more sentinel — the element moves on each page grow.
         _selfRef ??= DotNetObjectReference.Create(this);
@@ -757,6 +941,76 @@
                 await JS.InvokeVoidAsync("neolink.evMoreDetach");
         }
         catch { }
+    }
+
+    // ------------------------------------------------- live object boxes (preview)
+
+    private ApiDetect? _detect;
+
+    /// <summary>The clip on screen and the camera that recorded it, or null. The
+    /// same one-at-a-time rule as the live wall: the player is the only surface
+    /// here that gets boxes — the list's thumbnails are stills.</summary>
+    private (string VideoId, string Camera)? DetectSurface()
+    {
+        if (_detect is not { Enabled: true, Assets.State: "ready" }) return null;
+        if (_sdMode)
+            return _sdSelected != null && _sdCamera.Length > 0 ? ("ev-video", _sdCamera) : null;
+        return _selected is { HasClip: true, Camera: { Length: > 0 } cam } ? ("ev-video", cam) : null;
+    }
+
+    private (string VideoId, string Camera)? DetectTarget() => _boxes ? DetectSurface() : null;
+
+    /// <summary>Whether the boxes are wanted — the same per-device preference the
+    /// live wall keeps, so the switch means one thing across the app.</summary>
+    private bool _boxes = true;
+
+    private async Task ToggleBoxesAsync()
+    {
+        _boxes = !_boxes;
+        try { await JS.InvokeVoidAsync("neolink.lsSet", "neolink.boxes", _boxes ? "1" : "0"); } catch { }
+        await SyncDetectAsync();
+    }
+
+    /// <summary>Points the browser's detector at the clip being watched (or at
+    /// nothing). Idempotent: the detector only reacts when the answer changes.
+    /// The zones go first — no box may be drawn in a part of the view the camera
+    /// was told to ignore, not even for the frame before they arrive.</summary>
+    private async Task SyncDetectAsync()
+    {
+        var target = DetectTarget();
+        // The zones come off the camera, which can take a moment: awaiting that here
+        // would hold up every later render of the page. The answer arriving is itself
+        // a render, and this runs again with it.
+        if (target is { } t && !DetectZones.Known(t.Camera))
+        {
+            _ = InvokeAsync(async () =>
+            {
+                if (await DetectZones.EnsureAsync(t.Camera, Http, ApiBase, _token,
+                        _detect?.Groups ?? new List<string>()))
+                    StateHasChanged();
+            });
+        }
+        try
+        {
+            if (DetectZones.TakePush(target?.Camera) is { } push)
+                await JS.InvokeVoidAsync("neolink.detectZones", push);
+            await JS.InvokeVoidAsync("neolink.detect",
+                target is { } d && _detect is { } cfg && DetectZones.Known(d.Camera)
+                    ? new
+                    {
+                        videoId = d.VideoId,
+                        camera = d.Camera,
+                        @base = $"{Base}/detect/asset/",
+                        minConfidence = cfg.MinConfidence / 100.0,
+                        fps = cfg.Fps,
+                        groups = cfg.Groups,
+                        model = cfg.ModelFile,
+                    }
+                    : null);
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or TaskCanceledException)
+        {
+        }
     }
 
     // ------------------------------------------------------------ data plumbing
@@ -806,9 +1060,21 @@
             RedirectToSignIn();
             return default;
         }
-        if (!res.IsSuccessStatusCode) return default;
+        if (!res.IsSuccessStatusCode)
+        {
+            // The server's own reason, for banners that would otherwise only say "failed".
+            try
+            {
+                _lastApiError = (await res.Content.ReadFromJsonAsync<JsonElement>()).TryGetProperty("error", out var e)
+                    ? e.GetString() : null;
+            }
+            catch { _lastApiError = null; }
+            return default;
+        }
         return await res.Content.ReadFromJsonAsync<TValue>();
     }
+
+    private string? _lastApiError;
 
     // ------------------------------------------------------------ paging
 
@@ -853,10 +1119,120 @@
         catch { }
     }
 
-    private async Task OnSearchKeyAsync(KeyboardEventArgs e)
+    /// <summary>One letter is never a question worth asking a language model.</summary>
+    private const int SearchMinChars = 2;
+
+    // ---- advanced search dialog: the period and filters the question runs within ----
+    private bool _advOpen;
+    /// <summary>Both null = the rolling last 24 hours, the cheapest slice to read.</summary>
+    private DateTime? _advFrom, _advTo;
+    private bool AdvDated => _advFrom != null || _advTo != null;
+    private readonly HashSet<string> _advCams = new(StringComparer.OrdinalIgnoreCase); // empty = all
+    private bool _advUnreviewed;
+    private readonly HashSet<string> _advHiddenLevels = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Over a week of events is a lot for a model to read: the day
+    /// count to warn with, 0 for an open start, null when the period is fine.</summary>
+    private int? AdvWideDays
     {
-        if (e.Key == "Enter") await RunSearchAsync();
-        else if (e.Key == "Escape") ClearSearch();
+        get
+        {
+            if (!AdvDated) return null;
+            if (_advFrom == null) return 0;
+            int days = ((_advTo ?? DateTime.Today) - _advFrom.Value).Days + 1;
+            return days > 7 ? days : null;
+        }
+    }
+
+    /// <summary>The list's own period and filters are the dialog's starting point.</summary>
+    private void SeedAdvanced()
+    {
+        _advFrom = _from;
+        _advTo = _to;
+        _advCams.Clear();
+        if (CamFilterActive)
+            foreach (var c in _cameras.Where(c => CamVisible(c.Name))) _advCams.Add(c.Name);
+        _advUnreviewed = _unreviewedOnly;
+        _advHiddenLevels.Clear();
+        foreach (var l in _hiddenLevels) _advHiddenLevels.Add(l);
+    }
+
+    private async Task OpenAdvancedAsync()
+    {
+        // Editing a running search keeps its settings; a fresh one starts from the list.
+        if (_searchResults == null) SeedAdvanced();
+        _searchError = false;
+        _advOpen = true;
+        StateHasChanged();
+        await Task.Yield();
+        try { await JS.InvokeVoidAsync("neolink.focusEl", "ev-adv-q"); } catch { }
+    }
+
+    private void CloseAdvanced()
+    {
+        _advOpen = false;
+        if (_searchBusy)
+        {
+            // Cancelling releases the model; the list stays as it was.
+            _searchGen++;
+            _searchCts?.Cancel();
+            _searchBusy = false;
+        }
+    }
+
+    private void SetAdvRange(string? rawFrom, string? rawTo)
+    {
+        if (rawFrom != null) _advFrom = ParseDay(rawFrom);
+        if (rawTo != null) _advTo = ParseDay(rawTo);
+        if (_advFrom is { } f && _advTo is { } t && t < f)
+        {
+            if (rawFrom != null) _advTo = f; else _advFrom = t;
+        }
+    }
+
+    private void ToggleAdvCam(string name)
+    {
+        if (!_advCams.Remove(name)) _advCams.Add(name);
+        // Every camera picked is the same as no pick at all.
+        if (_advCams.Count == _cameras.Count) _advCams.Clear();
+    }
+
+    private void ToggleAdvLevel(string level)
+    {
+        if (!_advHiddenLevels.Remove(level)) _advHiddenLevels.Add(level);
+        if (_advHiddenLevels.Count == ThreatLevels.Length) _advHiddenLevels.Clear(); // none left = any
+    }
+
+    private async Task OnAdvKeyAsync(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !_searchBusy && _searchQ.Trim().Length >= SearchMinChars) await RunSearchAsync();
+        else if (e.Key == "Escape") CloseAdvanced();
+    }
+
+    /// <summary>The period and filters as the server takes them. The 24-hour
+    /// default is spelled out as a clock range so the server never reads more.</summary>
+    private string AdvancedQuery()
+    {
+        var sb = new System.Text.StringBuilder();
+        DateTime from, to;
+        if (!AdvDated) { from = DateTime.Now.AddHours(-24); to = DateTime.Now.AddMinutes(1); }
+        else { from = _advFrom ?? DateTime.MinValue; to = (_advTo ?? DateTime.Today).AddDays(1); }
+        if (from != DateTime.MinValue) sb.Append("&from=").Append(Uri.EscapeDataString(from.ToString("yyyy-MM-ddTHH:mm")));
+        sb.Append("&to=").Append(Uri.EscapeDataString(to.ToString("yyyy-MM-ddTHH:mm")));
+        if (_advCams.Count > 0) sb.Append("&cameras=").Append(Uri.EscapeDataString(string.Join(",", _advCams)));
+        if (_advUnreviewed) sb.Append("&unreviewed=true");
+        if (_advHiddenLevels.Count > 0)
+            sb.Append("&levels=").Append(string.Join(",", ThreatLevels.Where(l => !_advHiddenLevels.Contains(l))));
+        return sb.ToString();
+    }
+
+    /// <summary>Runs one of the model's object words as a search, from the chip
+    /// that shows it, within the list's current period and filters. The word is
+    /// the question, so Edit shows it as one the user could have typed.</summary>
+    private async Task SearchForAsync(string thing)
+    {
+        if (_searchResults == null) SeedAdvanced();
+        _searchQ = thing;
+        await RunSearchAsync();
     }
 
     private async Task RunSearchAsync()
@@ -875,7 +1251,7 @@
         {
             // The AI translate + judge passes can take a while on a local model.
             var res = await GetJsonAsync<ApiEventSearch>(
-                $"/api/events/search?q={Uri.EscapeDataString(q)}&limit=500", timeoutSeconds: 90,
+                $"/api/events/search?q={Uri.EscapeDataString(q)}&limit=500{AdvancedQuery()}", timeoutSeconds: 90,
                 abort: abort);
             // A clear or newer search while this one was in flight wins.
             if (gen != _searchGen) return;
@@ -885,6 +1261,7 @@
             }
             if (res?.Events != null)
             {
+                _advOpen = false;
                 _searchResults = res.Events;
                 _searchUsedAi = res.Ai;
                 _searchKwMiss = !res.KeywordsMatched;
@@ -963,17 +1340,19 @@
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
             while (await timer.WaitForNextTickAsync(_pollCts.Token))
             {
-                if (_sdMode || _showDelete || _delBusy || !_supported) continue;
+                if (_sdMode || _showDelete || _delBusy || _advOpen || !_supported) continue;
+                bool hidden = false;
+                try { hidden = await JS.InvokeAsync<bool>("neolink.pageHidden"); } catch { }
+                if (hidden) continue; // nobody is looking; the first visible tick catches up
                 List<ApiEvent>? list;
                 List<ApiEvent>? day = null;
                 try
                 {
                     list = await GetJsonAsync<List<ApiEvent>>("/api/events?limit=500",
                         abort: _pollCts.Token);
-                    // A pivoted day only gains events while it is today.
-                    if (_date is { } d && d == DateTime.Today)
-                        day = await GetJsonAsync<List<ApiEvent>>(
-                            $"/api/events?limit=10000&date={d:yyyy-MM-dd}", abort: _pollCts.Token);
+                    // A pivoted range only gains events while it reaches today.
+                    if (Dated && (_to == null || _to >= DateTime.Today))
+                        day = await GetJsonAsync<List<ApiEvent>>(RangeQuery(), abort: _pollCts.Token);
                 }
                 catch (OperationCanceledException) when (_pollCts.IsCancellationRequested) { throw; }
                 catch { continue; }
@@ -1015,7 +1394,7 @@
                 _events.Clear();
                 _events.AddRange(list);
             }
-            if (_date != null) await LoadDayAsync();
+            if (Dated) await LoadRangeAsync();
 
             // Keep the open player's metadata fresh (an ongoing clip finalizes).
             if (_selected != null)
@@ -1025,27 +1404,58 @@
         finally { _loading = false; }
     }
 
-    private async Task LoadDayAsync()
+    /// <summary>10000 = the server's dated cap: a busy range whole, every camera.
+    /// The list is newest-first, so a range wider than the cap shows its newest
+    /// end — which is the end being read.</summary>
+    private string RangeQuery()
     {
-        if (_date is not { } day) return;
-        // 10000 = the server's date-scoped cap: the whole day, every camera.
-        var list = await GetJsonAsync<List<ApiEvent>>($"/api/events?limit=10000&date={day:yyyy-MM-dd}");
-        _eventsForDate = list ?? new List<ApiEvent>();
+        var q = "/api/events?limit=10000";
+        if (_from is { } f) q += $"&date={f:yyyy-MM-dd}";
+        // A start with no end means "since then", and the API reads a lone date as
+        // one single day — so the open end is spelled out as today. Nothing can be
+        // recorded later than that.
+        if ((_to ?? (_from != null ? DateTime.Today : null)) is { } t)
+            q += $"&to={t:yyyy-MM-dd}";
+        return q;
     }
 
-    private async Task SetDateAsync(string? raw)
+    private async Task LoadRangeAsync()
+    {
+        if (!Dated) return;
+        _eventsForDate = await GetJsonAsync<List<ApiEvent>>(RangeQuery()) ?? new List<ApiEvent>();
+    }
+
+    private static DateTime? ParseDay(string? raw) =>
+        !string.IsNullOrWhiteSpace(raw) && DateTime.TryParse(raw, out var d) ? d.Date : null;
+
+    /// <summary>Sets one end of the range; the other is left as it was. An end
+    /// that would invert the range drags the other with it, so the two inputs can
+    /// never disagree.</summary>
+    private async Task SetRangeAsync(string? rawFrom, string? rawTo)
     {
         ResetPaging();
-        if (string.IsNullOrWhiteSpace(raw) || !DateTime.TryParse(raw, out var day))
+        if (rawFrom != null) _from = ParseDay(rawFrom);
+        if (rawTo != null) _to = ParseDay(rawTo);
+        if (_from is { } f && _to is { } t && t < f)
         {
-            _date = null;
+            if (rawFrom != null) _to = f; else _from = t;
+        }
+        if (!Dated)
+        {
             _eventsForDate = new List<ApiEvent>();
             return;
         }
-        _date = day.Date;
         _loading = true;
-        await LoadDayAsync();
+        await LoadRangeAsync();
         _loading = false;
+    }
+
+    private async Task ClearRangeAsync()
+    {
+        ResetPaging();
+        _from = _to = null;
+        _eventsForDate = new List<ApiEvent>();
+        await Task.CompletedTask;
     }
 
     // ------------------------------------------------------------ camera SD card
@@ -1077,6 +1487,7 @@
         _sdRecs = new List<ApiSdRecording>();
         _sdDays = new List<int>();
         _sdError = null;
+        _sdStreamLists.Clear();
         if (_sdCamera.Length == 0)
         {
             _sdError = T["No cameras are configured."];
@@ -1087,16 +1498,20 @@
         try
         {
             var cam = Uri.EscapeDataString(_sdCamera);
+            _lastApiError = null;
             var days = await GetJsonAsync<ApiSdDays>(
                 $"/api/cameras/{cam}/sdcard/days?year={_sdDate.Year}&month={_sdDate.Month}",
                 timeoutSeconds: 30);
-            _sdDays = days?.Days ?? new List<int>();
+            var daysError = days == null ? _lastApiError : null;
+            _sdDays = (days?.Days ?? new List<int>()).OrderByDescending(d => d).ToList(); // newest first
             var recs = await GetJsonAsync<ApiSdRecordings>(
                 $"/api/cameras/{cam}/sdcard/recordings?date={_sdDate:yyyy-MM-dd}",
                 timeoutSeconds: 95);
             if (recs == null && days == null)
             {
-                _sdError = T["This camera's SD card can't be browsed — it needs a Reolink HTTP API (http_address / HTTP enabled on the camera) and a mounted SD card."];
+                _sdError = daysError is { Length: > 0 } why
+                    ? T.F("This camera's SD card can't be browsed: {0}.", why)
+                    : T["This camera's SD card can't be browsed; it needs a mounted SD card, and the camera answered neither its HTTP API nor the Baichuan search."];
             }
             else if (recs == null)
             {
@@ -1104,13 +1519,13 @@
                 // failed query (the file search is much heavier and the camera
                 // may be busy), NOT an empty day. Saying "no recordings" here
                 // hid real failures behind an innocent-looking message.
-                _sdError = T["The camera answered the calendar but not the file search — it may be busy streaming. Hit refresh to retry; the server log has details."];
+                _sdError = T["The camera answered the calendar but not the file search; it may be busy streaming. Hit refresh to retry; the server log has details."];
             }
-            _sdRecs = recs?.Recordings ?? new List<ApiSdRecording>();
+            _sdRecs = (recs?.Recordings ?? new List<ApiSdRecording>()).OrderByDescending(r => r.Start).ToList();
         }
         catch (OperationCanceledException)
         {
-            _sdError = T["The camera is taking too long to answer the SD-card search — it is likely busy recording or streaming. Hit refresh to retry."];
+            _sdError = T["The camera is taking too long to answer the SD-card search; it is likely busy recording or streaming. Hit refresh to retry."];
         }
         catch (Exception ex)
         {
@@ -1135,10 +1550,132 @@
         await LoadSdAsync();
     }
 
-    private void SelectSdAsync(ApiSdRecording r)
+    private async Task SelectSdAsync(ApiSdRecording r)
     {
         _sdSelected = r;
-        _pendingVideoUrl = SdUrl(r); // attach after the <video> renders
+        _sdNote = null;
+        _sdPlaying = await SdTwinAsync(r, _sdSub) ?? r;
+        _sdPartial = true; // 1x until the whole clip is in
+        _pendingVideoUrl = SdUrl(_sdPlaying); // attach after the <video> renders
+        _ = PollSdStatusAsync(_sdPlaying);
+    }
+
+    /// <summary>True while the selected clip is still arriving from the camera: it plays at 1x only.</summary>
+    private bool _sdPartial;
+    private int _sdPollSeq;
+
+    private async Task PollSdStatusAsync(ApiSdRecording r)
+    {
+        int seq = ++_sdPollSeq;
+        var cam = Uri.EscapeDataString(_sdCamera);
+        for (int i = 0; i < 150 && seq == _sdPollSeq; i++)
+        {
+            await Task.Delay(i == 0 ? 500 : 2000);
+            if (seq != _sdPollSeq) return;
+            try
+            {
+                using var res = await Http.SendAsync(Req(HttpMethod.Get,
+                    $"/api/cameras/{cam}/sdcard/download?file={Uri.EscapeDataString(r.File)}&status=1"));
+                if (!res.IsSuccessStatusCode) continue;
+                var j = await res.Content.ReadFromJsonAsync<JsonElement>();
+                bool complete = j.TryGetProperty("complete", out var c) && c.GetBoolean();
+                bool spooling = j.TryGetProperty("spooling", out var sp) && sp.GetBoolean();
+                // No spool a minute in: the recording streams straight from the camera (nothing to wait for).
+                if (!complete && (spooling || i < 30)) continue;
+                _sdPartial = false;
+                StateHasChanged();
+                // A fresh URL swaps the growing stream for the finished, seekable file.
+                if (complete || _speed != 1)
+                    await JS.InvokeVoidAsync("neolink.eventPlayer", "ev-video", SdPlayerUrl(r), _speed, null, _autoplay, false);
+                return;
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>The player's URL for a card recording: once the clip is whole it changes, so the
+    /// player refetches the seekable file instead of keeping the stream it played meanwhile.</summary>
+    private string SdPlayerUrl(ApiSdRecording r) => SdUrl(r) + (_sdPartial ? "" : "&whole=1");
+
+    /// <summary>SD-card player: the sub-stream twin is wanted; what the player holds (the
+    /// selection or its twin); per-day lists fetched for the other stream.</summary>
+    private bool _sdSub;
+    private ApiSdRecording? _sdPlaying;
+    private string? _sdNote;
+    private readonly Dictionary<string, List<ApiSdRecording>> _sdStreamLists = new();
+
+    /// <summary>True once the day's search for the other quality came back empty: the camera keeps one copy only.</summary>
+    private bool SdOtherQualityAbsent(ApiSdRecording r) =>
+        _sdStreamLists.TryGetValue($"{(r.StreamType == "sub" ? "main" : "sub")}:{r.Start:yyyy-MM-dd}", out var list) && list.Count == 0;
+
+    /// <summary>The recording's copy in the other stream (same start, within 5 s), or null when the card has none.</summary>
+    private async Task<ApiSdRecording?> SdTwinAsync(ApiSdRecording r, bool sub)
+    {
+        var want = sub ? "sub" : "main";
+        if (r.StreamType == want) return r;
+        var key = $"{want}:{r.Start:yyyy-MM-dd}";
+        if (!_sdStreamLists.TryGetValue(key, out var list))
+        {
+            var cam = Uri.EscapeDataString(_sdCamera);
+            var recs = await GetJsonAsync<ApiSdRecordings>(
+                $"/api/cameras/{cam}/sdcard/recordings?date={r.Start:yyyy-MM-dd}&stream={want}", timeoutSeconds: 95);
+            list = recs?.Recordings ?? new List<ApiSdRecording>();
+            _sdStreamLists[key] = list;
+        }
+        return list.Where(t => Math.Abs((t.Start - r.Start).TotalSeconds) <= 5)
+            .OrderBy(t => Math.Abs((t.Start - r.Start).TotalSeconds)).FirstOrDefault();
+    }
+
+    private async Task SetSdQualityAsync(bool sub)
+    {
+        if (_sdSelected is not { } r)
+        {
+            _sdSub = sub;
+            return;
+        }
+        var twin = await SdTwinAsync(r, sub);
+        if (twin == null)
+        {
+            _sdNote = sub ? T["The card holds no low-res copy of this recording."]
+                          : T["The card holds no full-quality copy of this recording."];
+            return;
+        }
+        _sdSub = sub;
+        _sdNote = null;
+        _sdPlaying = twin;
+        _sdPartial = true;
+        await JS.InvokeVoidAsync("neolink.eventPlayer", "ev-video", SdUrl(twin), 1, null, _autoplay, false);
+        _ = PollSdStatusAsync(twin);
+    }
+
+    /// <summary>Gives the server the camera's recording password (kept in memory, sent
+    /// in the body), then reloads the open recording so the camera can decrypt it.</summary>
+    private async Task UnlockSdAsync()
+    {
+        try
+        {
+            var req = Req(HttpMethod.Post, $"/api/cameras/{Uri.EscapeDataString(_sdCamera)}/sdcard/unlock");
+            req.Content = JsonContent.Create(new { password = _sdUnlockPassword });
+            using var res = await Http.SendAsync(req);
+            if (!res.IsSuccessStatusCode)
+            {
+                _sdError = T.F("Request failed ({0})", (int)res.StatusCode);
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _sdError = T.F("Cannot reach {0}: {1}", _server, ex.Message);
+            return;
+        }
+        _sdUnlockPassword = "";
+        _sdUnlockOpen = false;
+        if ((_sdPlaying ?? _sdSelected) is { } r)
+        {
+            _sdPartial = true; // the unlocked fetch starts over
+            _pendingVideoUrl = SdUrl(r);
+            _ = PollSdStatusAsync(r);
+        }
     }
 
     private string SdUrl(ApiSdRecording r, bool dl = false) =>
@@ -1307,15 +1844,16 @@
 
     private IEnumerable<ApiEvent> Source() =>
         _searchResults != null ? _searchResults
-        : _date == null ? _events.Where(e => e.Start >= DateTime.UtcNow.AddHours(-24)) : _eventsForDate;
+        : !Dated ? _events.Where(e => e.Start >= DateTime.UtcNow.AddHours(-24)) : _eventsForDate;
 
     private IEnumerable<ApiEvent> Filtered =>
         Source()
             // Search results are explicit intent — hidden-camera prefs never trim them.
             .Where(e => _searchResults != null || CamVisible(e.Camera))
-            .Where(e => !_unreviewedOnly || !e.Reviewed)
-            .Where(e => _searchResults != null || _hiddenLevels.Count == 0
-                || (e.AiLevel != null && !_hiddenLevels.Contains(e.AiLevel)))
+            .Where(e => _searchResults != null || !_unreviewedOnly || !e.Reviewed)
+            // Only rated events are subject to the threat filter: one with no AI
+            // level yet (or ever) is not "at" a hidden level.
+            .Where(e => _searchResults != null || e.AiLevel == null || !_hiddenLevels.Contains(e.AiLevel))
             .OrderByDescending(e => e.Start);
 
     /// <summary>True once any loaded event carries an AI threat level — the gate
@@ -1329,15 +1867,28 @@
         return $"{url}{(url.Contains('?') ? '&' : '?')}v={ev.ArtifactVersion}";
     }
 
+    /// <summary>The camera's own copy (from its SD card) plays first when the event has one;
+    /// false switches to Neolink's clip. Reset per event.</summary>
+    private bool _cameraCopy = true;
+
     private string PlayerUrl(ApiEvent ev) =>
-        _sd && ev.HasPreview ? Artifact(ev, "preview") : Artifact(ev, "clip");
+        ev.HasCameraClip && _cameraCopy ? Artifact(ev, "camera")
+        : _sd && ev.HasPreview ? Artifact(ev, "preview") : Artifact(ev, "clip");
 
     /// <summary>The other stream is the silent error fallback, both ways: a
     /// preview can be an empty capture (sub stream never delivered a frame)
     /// while the clip plays, and a device out of video decoders can fail the
-    /// main stream but manage the sub-stream.</summary>
+    /// main stream but manage the sub-stream. A camera copy falls back to Neolink's clip.</summary>
     private string? PlayerFallback(ApiEvent ev) =>
-        ev.HasPreview && ev.HasClip ? Artifact(ev, _sd ? "clip" : "preview") : null;
+        ev.HasCameraClip && _cameraCopy ? (ev.HasClip ? Artifact(ev, "clip") : null)
+        : ev.HasPreview && ev.HasClip ? Artifact(ev, _sd ? "clip" : "preview") : null;
+
+    private async Task SetCameraCopyAsync(bool on)
+    {
+        _cameraCopy = on;
+        if (_selected is { } ev && (ev.HasClip || ev.HasCameraClip))
+            await JS.InvokeVoidAsync("neolink.eventPlayer", "ev-video", PlayerUrl(ev), _speed, PlayerFallback(ev), _autoplay, ev.Ongoing);
+    }
 
     /// <summary>Resolve a ?event={id} deep link: find the event (the rolling list, or a
     /// direct lookup for older ones), bring its day into the list, and play it.</summary>
@@ -1347,7 +1898,7 @@
                  ?? await GetJsonAsync<ApiEvent>($"/api/events/{Uri.EscapeDataString(id)}");
         if (ev == null)
         {
-            _error = T["That event no longer exists — it may have been cleaned up."];
+            _error = T["That event no longer exists; it may have been cleaned up."];
             return;
         }
         await OpenEventAsync(ev);
@@ -1366,17 +1917,18 @@
         // context (and the Older/Newer buttons) line up with what's playing.
         if (!Source().Any(e => e.Id == ev.Id))
         {
-            _date = ev.Start.ToLocalTime().Date;
-            await LoadDayAsync();
+            _from = _to = ev.Start.ToLocalTime().Date;
+            await LoadRangeAsync();
         }
         await SelectAsync(ev);
     }
 
     private async Task SelectAsync(ApiEvent ev)
     {
+        _cameraCopy = true; // the camera's own copy, when the event has one, plays first
         // _speed deliberately survives: the user's last pick applies to every event.
         _selected = ev;
-        if (ev.HasClip) _pendingVideoUrl = PlayerUrl(ev); // attach after the <video> renders
+        if (ev.HasClip || ev.HasCameraClip) _pendingVideoUrl = PlayerUrl(ev); // attach after the <video> renders
         WatchOngoing(ev);
         // Viewing an event is reviewing it: mark it the moment it's opened, not on close.
         if (!ev.Reviewed) await MarkReviewedAsync(ev);
@@ -1492,13 +2044,13 @@
                     : new List<CameraCount>();
                 if (_delCount == 0)
                     _delError = _delSkipped > 0
-                        ? T["Every selected event is still recording — nothing can be deleted yet."]
+                        ? T["Every selected event is still recording; nothing can be deleted yet."]
                         : T["Those events no longer exist."];
             }
             else
             {
                 _delError = _delServerError
-                            ?? T["Could not prepare the deletion — are you signed in as an admin?"];
+                            ?? T["Could not prepare the deletion; are you signed in as an admin?"];
             }
         }
         catch
@@ -1544,7 +2096,7 @@
         catch
         {
             _deleting = false;
-            _delError = T["The deletion failed — nothing may have been removed. Try again."];
+            _delError = T["The deletion failed; nothing may have been removed. Try again."];
         }
         StateHasChanged();
     }
@@ -1592,7 +2144,7 @@
                 _delServerError ??= $"{(int)res.StatusCode} {res.ReasonPhrase}";
                 if (!estimate && deleted > 0)
                     _delServerError = T.F(
-                        "{0} — {1} of the selected events were already deleted before this failure; the rest are untouched.",
+                        "{0}: {1} of the selected events were already deleted before this failure; the rest are untouched.",
                         _delServerError, deleted);
                 return null;
             }
@@ -1655,7 +2207,12 @@
                 s.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
         catch { }
-        if (_selected is { HasClip: true } ev)
+        if (_sdMode)
+        {
+            if ((_sdPlaying ?? _sdSelected) is { } sr)
+                await JS.InvokeVoidAsync("neolink.eventPlayer", "ev-video", SdPlayerUrl(sr), _sdPartial ? 1 : s, null, _autoplay, false);
+        }
+        else if (_selected is { HasClip: true } ev)
             await JS.InvokeVoidAsync("neolink.eventPlayer", "ev-video", PlayerUrl(ev), s, PlayerFallback(ev), _autoplay, ev.Ongoing);
     }
 
@@ -1753,6 +2310,9 @@
     public async ValueTask DisposeAsync()
     {
         try { await JS.InvokeVoidAsync("neolink.evMoreDetach"); } catch { }
+        // The detector outlives this page's elements otherwise, looping on a video
+        // that is no longer in the document.
+        try { await JS.InvokeVoidAsync("neolink.detect", (object?)null); } catch { }
         _searchCts?.Cancel();
         _ongoingCts?.Cancel();
         _pollCts.Cancel();

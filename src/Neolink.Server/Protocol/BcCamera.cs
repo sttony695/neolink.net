@@ -28,6 +28,27 @@ public sealed class AuthFailedException : Exception
     public AuthFailedException(string msg) : base(msg) { }
 }
 
+/// <summary>
+/// How to frame the opening "login upgrade" message. Two things vary independently:
+/// the encryption tier advertised in the response code, and whether the message
+/// carries the older 32-byte MD5 credential fields or no body at all. The default
+/// (FullAes, header only) is what every camera Neolink supports today expects, and
+/// is the only combination used unless a camera overrides it — some firmware resets
+/// the connection on it instead of answering (see docs/troubleshooting.md).
+/// </summary>
+public readonly record struct BcLoginMode(ushort UpgradeCode, bool LegacyCredentials)
+{
+    public static BcLoginMode Default => new(BcConstants.LegacyUpgradeFullAes, false);
+
+    public bool IsDefault => UpgradeCode == BcConstants.LegacyUpgradeFullAes && !LegacyCredentials;
+
+    /// <summary>Builds the mode from a camera's config values. An unrecognised
+    /// encryption name cannot reach here — the loader rejects it — so it falls back
+    /// to the default rather than inventing a code.</summary>
+    public static BcLoginMode From(string? maxEncryption, bool legacyCredentials) =>
+        new(BcConstants.ParseMaxEncryption(maxEncryption) ?? BcConstants.LegacyUpgradeFullAes, legacyCredentials);
+}
+
 /// <summary>High-level camera operations: login, video streaming, ping, control commands.</summary>
 public sealed class BcCamera : IBcCamera
 {
@@ -41,6 +62,7 @@ public sealed class BcCamera : IBcCamera
     public byte ChannelId => _channelId;
     public DeviceInfoXml? DeviceInfo { get; private set; }
     public System.Net.IPAddress? RemoteIp => _conn.RemoteEndpoint?.Address;
+    public Task<string> Closed => _conn.Closed;
 
     // Log tag: with several cameras every one is usually channel 0, so a bare
     // "ch0" is ambiguous in captures — callers pass the camera name instead.
@@ -80,24 +102,18 @@ public sealed class BcCamera : IBcCamera
     /// receive the negotiated encryption scheme + nonce, then send a modern XML login
     /// with nonce-salted MD5 credentials. On AES cameras, derive the session key.
     /// </summary>
-    public async Task LoginAsync(string username, string? password, CancellationToken ct)
+    public async Task LoginAsync(string username, string? password, CancellationToken ct,
+        BcLoginMode? mode = null)
     {
+        var login = mode ?? BcLoginMode.Default;
         using var sub = _conn.Subscribe(BcConstants.MsgIdLogin);
 
-        // Header-only "login upgrade": no legacy username/password body. The camera
-        // replies with the encryption scheme it will use and a login nonce.
-        var legacy = new BcMessage
-        {
-            Meta = new BcMeta
-            {
-                MsgId = BcConstants.MsgIdLogin,
-                ChannelId = _channelId,
-                MsgNum = NewMessageNum(),
-                StreamType = 0,
-                ResponseCode = BcConstants.LegacyUpgradeAes,
-                Class = BcConstants.ClassLegacy,
-            },
-        };
+        var legacy = BuildLoginUpgrade(_channelId, NewMessageNum(), username, password, login);
+        // An overridden login is a diagnostic the user set deliberately: say so once
+        // per connection tag, or their log gives no sign which framing was tried.
+        if (!login.IsDefault && LoggedLoginMode.TryAdd($"{_logTag}|{login}", 0))
+            Log.Info($"BC {_logTag}: login upgrade overridden — advertising 0x{login.UpgradeCode:x4}, " +
+                     (login.LegacyCredentials ? "legacy credential body" : "header only"));
         await _conn.SendAsync(legacy, ct).ConfigureAwait(false);
 
         var reply = await sub.ReceiveAsync(RxTimeout, ct).ConfigureAwait(false);
@@ -166,14 +182,68 @@ public sealed class BcCamera : IBcCamera
             0x02 => "AES (0x02, control XML only - media unencrypted)",
             _ => $"FullAes (0x{negotiated:x2}, media stream encrypted)",
         };
+        var keyType = reply.Xml?.Encryption?.Type ?? "";
+        if (keyType.Length > 0) encDesc += $", key type {keyType}";
         if (LoggedEncryption.TryAdd($"{_logTag}|{negotiated:x2}", 0))
+        {
             Log.Info($"BC {_logTag}: encryption negotiated: {encDesc}");
+            if (UnfamiliarEncryption(negotiated, keyType) is { } why)
+                Log.Warn($"BC {_logTag}: {why} — if video or commands fail on this camera, please report this line");
+        }
         else
             Log.Debug($"BC {_logTag}: encryption negotiated: {encDesc}");
     }
 
+    /// <summary>
+    /// The opening message of the login handshake. Public so the self-test can assert
+    /// the exact bytes each mode puts on the wire — the default has to stay
+    /// byte-identical, since every working camera is logging in with it today.
+    /// </summary>
+    public static BcMessage BuildLoginUpgrade(byte channelId, ushort msgNum, string username,
+        string? password, BcLoginMode mode)
+    {
+        // Header-only "login upgrade": no legacy username/password body. The camera
+        // replies with the encryption scheme it will use and a login nonce.
+        var msg = new BcMessage
+        {
+            Meta = new BcMeta
+            {
+                MsgId = BcConstants.MsgIdLogin,
+                ChannelId = channelId,
+                MsgNum = msgNum,
+                StreamType = 0,
+                ResponseCode = mode.UpgradeCode,
+                Class = BcConstants.ClassLegacy,
+            },
+        };
+        // The older framing carries the MD5 credentials in the body instead. Both
+        // are in the wild, and firmware that resets on one can accept the other.
+        if (mode.LegacyCredentials)
+        {
+            msg.LegacyUsername = Md5Utils.Md5String31(username, zeroLast: true);
+            msg.LegacyPassword = password == null
+                ? BcConstants.EmptyLegacyPassword
+                : Md5Utils.Md5String31(password, zeroLast: true);
+        }
+        return msg;
+    }
+
     /// <summary>Connection tags whose negotiated encryption level was already announced at Info.</summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> LoggedEncryption = new();
+
+    /// <summary>Why a negotiated scheme is outside what Neolink knows, or null. Unknown
+    /// codes still run as FullAes (MD5 key, AES-CFB); this only makes them visible.</summary>
+    internal static string? UnfamiliarEncryption(int negotiated, string keyType)
+    {
+        if (negotiated is not (0x00 or 0x01 or 0x02 or 0x12))
+            return $"the camera chose encryption scheme 0x{negotiated:x2}, which Neolink has not seen; treating it as FullAes";
+        if (negotiated >= 0x02 && keyType.Length > 0 && !keyType.Equals("md5", StringComparison.OrdinalIgnoreCase))
+            return $"the camera announced key type '{keyType}', but Neolink derives its AES key with MD5";
+        return null;
+    }
+
+    /// <summary>Connection tags whose overridden login framing was already announced.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> LoggedLoginMode = new();
 
     /// <summary>
     /// Requests the video stream and pumps the raw binary sub-stream chunks into
@@ -246,6 +316,13 @@ public sealed class BcCamera : IBcCamera
                             holding = true;
                             Log.Debug($"{_logTag}: no video — camera is in privacy mode; holding the connection");
                         }
+                        continue;
+                    }
+                    // An SD-card transfer on this session starves the video on a thin link: tearing the
+                    // session down would kill the transfer, so the stall is waited out until it ends.
+                    if (Volatile.Read(ref _transfers) > 0)
+                    {
+                        Log.Debug($"{_logTag}: no video while an SD-card transfer runs; holding the connection");
                         continue;
                     }
                     throw new IOException("Video stream stalled (no data for 15s)");
@@ -413,6 +490,7 @@ public sealed class BcCamera : IBcCamera
                     or "crossline" or "cross_line" or "tripwire"
                     or "intrude" or "intrusion" or "region" or "perimeter"
                     or "linger" or "loiter" or "loitering"
+                    or "legacy" or "loss"
                 && !aiTypes.Contains(token))
                 aiTypes.Add(token);
         }
@@ -664,6 +742,92 @@ public sealed class BcCamera : IBcCamera
             if (expected < 0 && jpeg.Length > 0)
                 return jpeg.ToArray(); // no size advertised: single-message JPEG
         }
+    }
+
+    /// <summary>SD-card transfers in flight on this session (the video stall watchdog stands down meanwhile).</summary>
+    private int _transfers;
+
+    /// <summary>SD-card download (msg 8): an XML reply, then BcMedia frames as binary messages,
+    /// then a data-free message at the end of the file. Always closes with msg 9.</summary>
+    public async Task<long> DownloadFileAsync(XElement request, long expectedBytes, Stream dest, CancellationToken ct)
+    {
+        Interlocked.Increment(ref _transfers);
+        try { return await DownloadFileCoreAsync(request, expectedBytes, dest, ct).ConfigureAwait(false); }
+        finally { Interlocked.Decrement(ref _transfers); }
+    }
+
+    private async Task<long> DownloadFileCoreAsync(XElement request, long expectedBytes, Stream dest, CancellationToken ct)
+    {
+        using var sub = _conn.Subscribe(BcConstants.MsgIdDownload);
+        var ext = new ExtensionXml { ChannelId = _channelId };
+        await _conn.SendAsync(new BcMessage
+        {
+            Meta = new BcMeta
+            {
+                MsgId = BcConstants.MsgIdDownload,
+                ChannelId = _channelId,
+                MsgNum = NewMessageNum(),
+                StreamType = 0,
+                ResponseCode = 0,
+                Class = BcConstants.ClassModern,
+            },
+            Extension = ext,
+            Xml = BcXmlBody.FromRaw(request),
+        }, ct).ConfigureAwait(false);
+
+        long got = 0;
+        bool loggedHead = false, wentQuiet = false;
+        try
+        {
+            while (true)
+            {
+                BcMessage reply;
+                // The listed size is the usual end (every model so far sends exactly it); past it
+                // only a short wait, in case a firmware sends more; before it, the camera's silence.
+                bool complete = expectedBytes > 0 && got >= expectedBytes;
+                try
+                {
+                    reply = await sub.ReceiveAsync(
+                        got == 0 ? TimeSpan.FromSeconds(20) : complete ? TimeSpan.FromMilliseconds(400) : TimeSpan.FromSeconds(8),
+                        ct).ConfigureAwait(false);
+                }
+                catch (TimeoutException) when (got > 0)
+                {
+                    wentQuiet = !complete; // silence short of the listed size is a dropped link, not the end
+                    break;
+                }
+                if (reply.Binary is { Length: > 0 } bin)
+                {
+                    await dest.WriteAsync(bin, ct).ConfigureAwait(false);
+                    got += bin.Length;
+                    continue;
+                }
+                if (!loggedHead && reply.Xml is { Raw.Count: > 0 } x)
+                {
+                    loggedHead = true;
+                    Log.Debug($"BC {_logTag}: SD download reply: " +
+                              string.Concat(x.Raw.Select(e => e.ToString(SaveOptions.DisableFormatting))));
+                }
+                if (got > 0) break; // the data-free end-of-file message
+                if (reply.Meta.ResponseCode is not (200 or 0))
+                    throw new CameraCommandException(BcConstants.MsgIdDownload, reply.Meta.ResponseCode);
+            }
+        }
+        finally
+        {
+            try
+            {
+                await SendCommandAsync(BcConstants.MsgIdDownloadStop, BcXmlBody.FromRaw(new XElement(request)), ext,
+                    TimeSpan.FromSeconds(2), tolerateNoReply: true, ct: CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is CameraCommandException or TimeoutException or IOException
+                                       or ObjectDisposedException or InvalidOperationException) { }
+        }
+        // Silence well short of the listed size is a dropped link, not a recording. A camera that
+        // closes the file itself with fewer bytes than listed is believed (some firmwares do).
+        if (wentQuiet && expectedBytes > 0 && got < expectedBytes * 98 / 100)
+            throw new IOException($"the camera stopped sending after {got / 1024} KB of {expectedBytes / 1024} KB (its link dropped)");
+        return got;
     }
 
     public async Task TalkAsync(TalkAbilityXml ability, ChannelReader<byte[]> frames, CancellationToken ct)
