@@ -797,6 +797,32 @@ html, body {
     user-select: none;
 }
 
+/* Live object boxes: a canvas laid exactly over the <video>, so the detector can
+   draw in the element's own pixels and let digital zoom (a transform on the
+   video, mirrored onto this) carry the boxes along with the picture. */
+.tile-detect {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+.tile-detect-badge {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px solid color-mix(in srgb, var(--line) 70%, transparent);
+    color: var(--muted);
+    font-size: 10px;
+    letter-spacing: 0.4px;
+    pointer-events: none;
+    user-select: none;
+}
+
 .tile-status {
     position: absolute;
     inset: 0;
@@ -2900,7 +2926,7 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
     pointer-events: none; /* clicks land on the card (open player) */
 }
 
-.event-thumb-icon { font-size: 30px; opacity: 0.8; }
+.event-thumb-icon { display: inline-flex; opacity: 0.8; }
 
 .event-live {
     position: absolute;
@@ -2974,6 +3000,26 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
 
 /* The description banner in the event players (Events page + quick view):
    a quiet card with the verdict chip leading the sentence. */
+/* What the model listed as visible, above its prose: a row of small words, each
+   one a search for itself. Deliberately quieter than the description — an
+   inventory is for scanning and for clicking, not for reading. */
+.event-objects {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 6px 0 0;
+}
+
+.event-object {
+    padding: 1px 8px;
+    font-size: 11px;
+    letter-spacing: 0.2px;
+    color: var(--muted);
+    text-transform: lowercase;
+}
+
+.event-object:hover { color: var(--accent); border-color: var(--accent); }
+
 .event-ai {
     display: flex;
     align-items: flex-start;
@@ -3199,6 +3245,7 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
     width: min(1440px, calc(100vw - 32px));
     height: fit-content;
     max-height: calc(100vh - 32px);
+    max-height: calc(100dvh - 32px);
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 12px;
@@ -3258,7 +3305,9 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
 .event-player-media {
     position: relative;
     width: 100%;
-    max-height: calc(100vh - 180px);
+    display: flex;
+    flex: 1 1 auto;
+    min-height: 0;
     background: #000;
     border-radius: 8px;
     overflow: hidden;
@@ -3288,7 +3337,9 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
     display: block;
     width: 100%;
     aspect-ratio: 16 / 9; /* stable modal size while media loads */
-    max-height: calc(100vh - 180px);
+    min-height: 0;
+    max-height: 100%;
+    object-fit: contain;
     background: #000;
     outline: none;
 }
@@ -3319,12 +3370,46 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
 .ev-autoplay input { cursor: pointer; margin: 0; }
 
 /* ---- multi-select delete: action bar, row checkboxes, confirm dialog ---- */
-/* Label and bar share one line; on narrow screens the bar wraps below. */
-.ev-search-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 10px 0 4px; padding-left: 10px; }
-.ev-search-row .ev-search { flex: 1 1 auto; min-width: 260px; }
-.ev-search-head { display: flex; align-items: center; gap: 7px; flex: 0 0 auto; }
-.ev-search-title { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
-.ev-search-hint { font-size: 12px; color: var(--muted); margin: 4px 0 2px; padding-left: 10px; max-width: 640px; }
+/* ---- advanced search dialog ---- */
+/* Reads as the page's one real button, not another filter chip. */
+.ev-adv-btn {
+    white-space: nowrap;
+    border: 1.5px solid var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+    padding: 4px 13px;
+    margin-left: 4px;
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.ev-adv-btn:hover { background: var(--accent); color: #fff; }
+.ev-adv-btn.chip-active { background: var(--accent); color: #fff; }
+.ev-adv-dialog { width: min(560px, calc(100vw - 24px)); }
+.ev-del-title.ev-adv-title { color: var(--accent); }
+.ev-adv-q { max-width: none; width: 100%; font-size: 14px; padding: 8px 12px; }
+.ev-adv-hint { font-size: 12px; color: var(--muted); margin: 6px 0 2px; line-height: 1.4; }
+.ev-adv-section {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    color: var(--muted);
+    margin: 14px 0 6px;
+}
+.ev-adv-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ev-adv-row .tool-label { margin-left: 0; }
+.ev-adv-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ev-adv-warn { padding: 6px 0 0; font-size: 12px; }
+.ev-adv-go {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--accent);
+    color: #fff;
+    border-color: transparent;
+}
+.ev-adv-go:not(:disabled):hover { filter: brightness(1.1); }
+.ev-adv-go:disabled { opacity: 0.5; cursor: default; }
+.ev-adv-go .btn-spinner { border-top-color: #fff; }
+.ev-search-q { display: inline-flex; align-items: center; gap: 4px; color: var(--text); max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Camera multi-select: chip button + checkbox popover. */
 .cam-filter { position: relative; display: inline-flex; }
@@ -3349,31 +3434,22 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
 }
 .cam-filter-menu label { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; white-space: nowrap; }
 .cam-filter-menu .cam-filter-all { padding-bottom: 7px; border-bottom: 1px solid var(--line); }
-.ev-search {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex: 0 0 auto;
-    padding: 6px 14px;
-    border-bottom: 1px solid var(--line);
+
+/* Phones: the toolbar scrolls sideways (overflow-x: auto), which clips an
+   absolute popover to the strip. A fixed bottom sheet escapes the clip. */
+@media (max-width: 700px) {
+    .cam-filter-menu {
+        position: fixed;
+        top: auto;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        border-radius: 12px 12px 0 0;
+        padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+        max-height: 60vh;
+    }
+    .cam-filter-menu label { font-size: 15px; padding: 4px 0; }
 }
-.ev-search-icon { display: inline-flex; color: var(--muted); flex: 0 0 auto; }
-.ev-search-icon.ai { color: var(--accent); }
-.ev-search-box { position: relative; flex: 1 1 auto; min-width: 0; max-width: 520px; display: flex; }
-.ev-search-box .ev-search-input { max-width: none; width: 100%; padding-right: 30px; }
-.ev-search-clear {
-    position: absolute;
-    right: 6px;
-    top: 50%;
-    transform: translateY(-50%);
-    display: inline-flex;
-    padding: 3px;
-    background: none;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-}
-.ev-search-clear:hover { color: var(--text); }
 .ev-search-input {
     flex: 1 1 auto;
     min-width: 0;
@@ -3537,11 +3613,14 @@ body.is-fullscreen .fs-exit { display: inline-flex; }
 /* Events ⇄ Live segmented toggle in the toolbar */
 .ev-switch {
     display: inline-flex;
+    flex: 0 0 auto; /* the phone toolbar scrolls; a shrinking switch vanished instead */
     border: 1px solid var(--line);
     border-radius: 999px;
     overflow: hidden;
     background: var(--panel-2);
 }
+/* One line per control in the sideways-scrolling phone toolbar. */
+.ev-toolbar .chip, .ev-toolbar .cam-filter, .ev-toolbar .event-filter { flex: 0 0 auto; white-space: nowrap; }
 .ev-switch-opt {
     padding: 4px 14px;
     font-size: 12px;
@@ -3804,6 +3883,21 @@ button.ev-switch-opt {
     will-change: transform;
 }
 
+/* A player handed fullscreen (see detect.js: the native button fullscreens the
+   bare <video>, which would leave the boxes behind on the page) has to fill the
+   screen — its normal height cap is sized for sitting inside a dialog. */
+.event-player-media:fullscreen {
+    max-height: none;
+    height: 100%;
+    border-radius: 0;
+}
+
+.event-player-media:fullscreen video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
 .zoom-badge {
     font-size: 10px;
     font-weight: 700;
@@ -3822,6 +3916,7 @@ button.ev-switch-opt {
     font-weight: 700;
     letter-spacing: 0.5px;
 }
+
 
 /* While zoomed the frame pans with a drag */
 .zoomed video { cursor: grab; }
@@ -4434,6 +4529,22 @@ button.ev-switch-opt {
     pointer-events: none;
 }
 
+/* The camera's own copy of an event (from its SD card): drawn under Neolink's coverage. */
+.tl-cov-sd {
+    background: #3f6e62;
+    pointer-events: auto;
+}
+
+/* What the camera's card holds, whether or not Neolink has the same minutes: a strip along the lane's foot. */
+.tl-sd-strip {
+    position: absolute;
+    bottom: 1px;
+    height: 3px;
+    min-width: 2px;
+    background: #5fa88f;
+    border-radius: 1px;
+}
+
 .tl-ev {
     position: absolute;
     top: 15%;
@@ -4562,6 +4673,9 @@ body.tl-colresizing, body.tl-colresizing * { cursor: col-resize !important; user
     overflow-y: auto;
     align-content: stretch;
 }
+
+/* No camera picked: the hint sits centered where the monitors go. */
+.tl-grid > .notice { margin: auto; text-align: center; }
 
 .tl-tile {
     position: relative;
@@ -4695,6 +4809,16 @@ body.tl-colresizing, body.tl-colresizing * { cursor: col-resize !important; user
    camera is unmuted, so which monitor you are hearing is visible at a glance. */
 .tl-audio { right: 40px; }
 .tl-audio.on { opacity: 1; color: var(--accent); background: rgba(0, 0, 0, 0.78); }
+
+/* Object boxes get the live view's on-video pill rather than a fourth flat
+   button: it is the same control in the same clothes, and it is lit on the one
+   monitor carrying them — only one can, so it doubles as the answer to "which".
+   It hangs just under the zoom pill exactly as it does on a camera's own view —
+   until the monitor is too short for that, when it stops at the foot instead of
+   sliding off the bottom (a board can show eight cameras at once). */
+.tl-tile .cam-rail { top: min(calc(50% + 88px), calc(100% - 54px)); }
+
+.tl-tile-rail .cam-rail { display: none; } /* thumbnails: too small, focus first */
 
 /* ---------------------------------------------------------------- bookmarks
    Gold ribbons in the ruler's empty top band (ticks start at 8px, so the
@@ -4939,14 +5063,23 @@ body.tl-colresizing, body.tl-colresizing * { cursor: col-resize !important; user
 .player-speed {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     margin-top: 2px;
-    flex-wrap: wrap; /* speed + quality groups wrap on narrow screens */
+    flex-wrap: nowrap; /* speed and quality stay on one line, phone included */
 }
 
-/* The HD/SD group sits apart from the speed chips. */
-.player-quality-label {
-    margin-left: 10px;
+.player-group { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+
+/* Divider standing in for the SPEED / QUALITY headings, which cost more width
+   than they were worth once the chips themselves say what they do. */
+.player-div { color: var(--muted); opacity: 0.45; user-select: none; }
+
+/* Phones: seven chips have to share the width, so they lose their roomy padding
+   rather than the row losing its shape. */
+@media (max-width: 560px) {
+    .player-speed { gap: 6px; }
+    .player-speed .chip { padding: 3px 7px; font-size: 11px; }
+    .player-group { gap: 4px; }
 }
 
 /* Admin server-settings fields */
@@ -5114,12 +5247,18 @@ body.tl-colresizing, body.tl-colresizing * { cursor: col-resize !important; user
     padding: 10px 12px 8px;
 }
 
+/* Items move to the next line whole, never break inside, and a value keeps the
+   width of its widest reading: a legend that re-wrapped as the numbers ticked
+   over made the whole page jump several times a second. */
 .mon-chart-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 10px;
+    gap: 2px 10px;
     margin-bottom: 6px;
 }
+
+.mon-chart-title, .mon-leg, .mon-chart-max { white-space: nowrap; }
 
 .mon-chart-title {
     font-size: 12px;
@@ -5144,6 +5283,7 @@ body.tl-colresizing, body.tl-colresizing * { cursor: col-resize !important; user
     color: var(--text);
     font-weight: 600;
     font-variant-numeric: tabular-nums;
+    min-width: 7ch;
 }
 
 /* Y-axis ceiling, right-aligned over the plot */
@@ -5519,6 +5659,17 @@ body.tl-colresizing, body.tl-colresizing * { cursor: col-resize !important; user
     max-width: 160px;
 }
 
+/* Per-account camera picker, opened under its user row. */
+.user-cams-edit { padding: 2px 0 8px 18px; }
+.user-cams { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.user-cams-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
 /* ------------------------------------------------------------ stream chips */
 
 .stream-chip { cursor: default; }
@@ -5597,6 +5748,14 @@ body.tl-colresizing, body.tl-colresizing * { cursor: col-resize !important; user
     vertical-align: 1px;
 }
 
+/* The preview callout on the Experimental tab: the purple of .preview-tag, with a
+   left rule so it reads as a warning rather than an intro paragraph. */
+.notice.preview-note {
+    border-left: 3px solid color-mix(in srgb, #b48ce8 55%, transparent);
+    padding-left: 8px;
+    margin-bottom: 8px;
+}
+
 /* A staged (not yet applied) camera-setting value: amber + dashed = provisional. */
 .chip-pending,
 .chip.chip-pending {
@@ -5651,6 +5810,13 @@ select.input-pending {
 }
 
 /* ---------- detection-zone editor ---------- */
+/* Where a zone is KEPT changes what editing it means, so the note that says so is
+   set apart from the ordinary help text below it rather than reading as more of it. */
+.zone-local {
+    border-left: 2px solid #5b9dff;
+    padding-left: 8px;
+}
+
 .zone-editor {
     position: fixed;
     inset: 0;
@@ -5836,6 +6002,54 @@ textarea.ai-prompt {
     overflow-y: auto;
     padding-right: 2px;
 }
+
+/* Emergency mode (beta): armed reads as a red state everywhere it appears, and
+   the per-camera grid keeps its four chips in fixed columns. */
+.settings-tab .tab-dot-armed { color: var(--err); }
+.emg-arm-row { align-items: center; }
+.emg-armed { color: var(--err); font-weight: 600; letter-spacing: .04em; }
+
+.chip-armed {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 55%, transparent);
+    background: color-mix(in srgb, var(--err) 14%, transparent);
+}
+
+.notice.emg-warn {
+    border-color: color-mix(in srgb, var(--err) 45%, transparent);
+    background: color-mix(in srgb, var(--err) 10%, transparent);
+}
+
+.emg-warn-list {
+    margin: 6px 0 8px;
+    padding-left: 18px;
+    line-height: 1.5;
+}
+
+.emg-cam-cols {
+    display: inline-grid;
+    grid-template-columns: repeat(4, 52px);
+    gap: 4px;
+    text-align: center;
+}
+
+.emg-cam-head .emg-cam-cols {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .05em;
+}
+
+/* Full-width in its column so the pills line up under the headings. .chip is a
+   flex container, which packs its label left — centre it, or the text sits off
+   to one side of a pill that is wider than the word. */
+.emg-cam-chip {
+    padding: 2px 0;
+    width: 100%;
+    justify-content: center;
+}
+/* "auto" = inheriting the all-cameras choice: present, but not asserting. */
+.chip-auto { opacity: 0.7; border-style: dashed; }
 
 /* Invalid email field + its inline reason, and the "edited but unsaved" accent
    on config.json fields (mirrors the header badge / footer note). */
@@ -6060,4 +6274,102 @@ textarea.ai-prompt {
     }
 
     .settings-panel.settings-wide { width: min(96vw, 760px); }
+}
+
+/* Armed emergency mode, on the brand line: the one state that must be visible
+   without opening a dialog. */
+.brand-emg {
+    display: inline-flex;
+    align-items: center;
+    color: var(--err);
+    cursor: pointer;
+    animation: emg-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes emg-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+
+/* Home grid while the saved layout is still being read back: one calm panel in
+   place of the tiles, in both grid and free modes. */
+.stage-loading {
+    grid-column: 1 / -1;
+    align-self: center;
+    justify-self: center;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 18px;
+    color: var(--muted);
+    font-size: 14px;
+}
+
+.grid.mode-free .stage-loading {
+    position: absolute;
+    inset: 0;
+    justify-content: center;
+}
+
+/* Emergency mode armed: the toolbar pulses red until it is switched off, and
+   carries its own off switch at the right end. */
+.toolbar-emg {
+    border-bottom-color: var(--err);
+    animation: toolbar-emg 1.3s ease-in-out infinite;
+}
+
+@keyframes toolbar-emg {
+    0%, 100% { background: var(--panel); }
+    50% { background: color-mix(in srgb, var(--err) 26%, var(--panel)); }
+}
+
+.emg-toolbar-btn {
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 45%, transparent);
+    margin-left: 6px;
+}
+
+.emg-toolbar-btn:hover:not(:disabled) {
+    color: var(--err);
+    border-color: var(--err);
+    background: color-mix(in srgb, var(--err) 16%, transparent);
+}
+
+/* A flashing bar is exactly what motion sensitivity asks us not to do: hold a
+   steady red instead, so the state is still unmistakable. */
+@media (prefers-reduced-motion: reduce) {
+    .toolbar-emg {
+        animation: none;
+        background: color-mix(in srgb, var(--err) 20%, var(--panel));
+    }
+}
+
+/* Phones scroll the toolbar sideways, which would park the off switch past the
+   right edge. Pin it so it is always on screen — the one control that must
+   never need hunting for. */
+@media (max-width: 700px) {
+    .emg-toolbar-btn {
+        position: sticky;
+        right: 0;
+        margin-left: auto;
+        background: var(--panel);
+        box-shadow: -10px 0 10px -6px var(--panel);
+    }
+
+    .toolbar-emg .emg-toolbar-btn {
+        background: color-mix(in srgb, var(--err) 22%, var(--panel));
+        box-shadow: -10px 0 10px -6px color-mix(in srgb, var(--err) 22%, var(--panel));
+    }
+}
+
+/* A toolbar disarm that failed: the settings dialog is closed, so this is the
+   only place the reason can appear. */
+.toolbar-emg-error {
+    max-width: 40ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--err);
+    font-size: 11px;
+    padding-left: 8px;
 }

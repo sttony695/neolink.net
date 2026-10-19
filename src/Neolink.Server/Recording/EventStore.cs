@@ -22,9 +22,21 @@ public sealed class EventRecord
     public bool HasThumb { get; set; }
     /// <summary>A low-res sub-stream twin of the clip exists (preview.mp4), for strip previews.</summary>
     public bool HasPreview { get; set; }
+    /// <summary>The camera's own recording of the event (camera.mp4), fetched from its SD card.</summary>
+    public bool HasCameraClip { get; set; }
+    public DateTime? CameraClipStartUtc { get; set; }
+    public double? CameraClipSeconds { get; set; }
+    /// <summary>Seconds of video actually in clip.mp4; shorter than the event when the stream died.</summary>
+    public double? ClipSeconds { get; set; }
     /// <summary>What an LLM said it saw (AI event descriptions, opt-in) — written
     /// after the event closes, once the model answers; null until/unless it does.</summary>
     public string? AiDescription { get; set; }
+    /// <summary>What the model says is IN the frames — "person", "white van",
+    /// "package" — most important first. The camera's own labels say which of four
+    /// kinds of thing tripped the detector; this says what was actually there, in
+    /// words a person would search for. Empty until a description arrives, and on
+    /// every event described before this existed.</summary>
+    public List<string> AiObjects { get; set; } = new();
     /// <summary>The model's threat classification: "green" (routine), "yellow"
     /// (suspicious) or "red" (danger — weapon, fighting, break-in, fire).</summary>
     public string? AiLevel { get; set; }
@@ -218,6 +230,64 @@ public sealed class EventStore
         lock (_gate) { return _byId[rec.Id].Dir; }
     }
 
+    /// <summary>Fills in clip lengths for events stored before they were recorded: one file at a time, unhurried.</summary>
+    public async Task BackfillClipLengthsAsync(CancellationToken ct)
+    {
+        List<EventRecord> todo;
+        lock (_gate) { todo = _byId.Values.Select(e => e.Record).Where(r => r.ClipSeconds == null && r.HasClip && !r.Ongoing).ToList(); }
+        if (todo.Count == 0) return;
+        Log.Info($"Events: reading the clip length of {todo.Count} earlier event(s) in the background");
+        foreach (var rec in todo)
+        {
+            if (ct.IsCancellationRequested) return;
+            ClipSecondsOrProbe(rec);
+            await Task.Delay(50, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The clip's length, read from the file once for events recorded before it was stored (0 = unknown).</summary>
+    public double? ClipSecondsOrProbe(EventRecord rec)
+    {
+        if (rec.ClipSeconds != null || !rec.HasClip || rec.Ongoing) return rec.ClipSeconds;
+        double seconds = 0;
+        try
+        {
+            if (ArtifactPath(rec.Id, "clip.mp4") is { } path)
+            {
+                using var file = FootageVault.OpenRead(path);
+                seconds = Math.Round(ClipLength(file) ?? 0, 1);
+            }
+        }
+        catch (Exception ex) { Log.Debug($"Events: clip length of {rec.Id} unknown: {ex.Message}"); }
+        rec.ClipSeconds = seconds;
+        Save(rec);
+        return seconds;
+    }
+
+    /// <summary>Seconds in the mvhd of a closed MP4 (moov at either end); null for a fragmented or odd file.</summary>
+    internal static double? ClipLength(Stream file)
+    {
+        Span<byte> head = stackalloc byte[8];
+        var be = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian;
+        for (long at = 0; at + 8 <= file.Length;)
+        {
+            file.Position = at;
+            if (file.Read(head) < 8) return null;
+            long size = be(head);
+            if (size == 1 || size < 8) return null; // 64-bit sizes never come from the clip writer
+            if (head[4..].SequenceEqual("moov"u8))
+            {
+                if (size > 64 * 1024 * 1024) return null;
+                var moov = new byte[size];
+                file.Position = at;
+                file.ReadExactly(moov);
+                return Media.Mp4Pipe.MoovSeconds(moov);
+            }
+            at += size;
+        }
+        return null;
+    }
+
     public EventRecord? Find(string id)
     {
         lock (_gate) { return _byId.TryGetValue(id, out var e) ? e.Record : null; }
@@ -292,26 +362,31 @@ public sealed class EventStore
     /// Date-scoped queries allow a far higher cap: the day itself bounds the
     /// reply, and the day views must show a busy day whole.</summary>
     public List<EventRecord> List(string? camera = null, bool? reviewed = null, int limit = 200,
-        DateTime? localDate = null, bool excludeWakeOnly = false)
+        DateTime? localDate = null, bool excludeWakeOnly = false, DateTime? localTo = null,
+        IReadOnlySet<string>? onlyCameras = null)
     {
         limit = Math.Clamp(limit, 1, 100_000);
-        var day = localDate?.Date;
+        // A lone date is a one-day range, which is what every existing caller asks
+        // for; a lone end is everything up to it.
+        var from = localDate?.Date;
+        var to = localTo?.Date ?? localDate?.Date;
         var matched = new List<EventRecord>(Math.Min(limit, 512));
         lock (_gate)
         {
             // Newest first off the sorted index, stopping at the limit — and, for
-            // a day query, at the first event older than that day.
+            // a dated query, at the first event older than the range.
             for (int i = _byStart.Count - 1; i >= 0 && matched.Count < limit; i--)
             {
                 var r = _byStart[i];
                 if (camera != null && !string.Equals(r.Camera, camera, StringComparison.OrdinalIgnoreCase)) continue;
+                if (onlyCameras != null && !onlyCameras.Contains(r.Camera)) continue;
                 if (reviewed != null && r.Reviewed != reviewed) continue;
                 if (excludeWakeOnly && r.Labels is ["wake"]) continue;
-                if (day is { } d)
+                if (from != null || to != null)
                 {
                     var rd = r.StartUtc.ToLocalTime().Date;
-                    if (rd > d) continue;
-                    if (rd < d) break;
+                    if (to is { } hi && rd > hi) continue;
+                    if (from is { } lo && rd < lo) break;
                 }
                 matched.Add(r);
             }
@@ -333,25 +408,32 @@ public sealed class EventStore
     private readonly Dictionary<string, (List<string> Days, DateTime At)> _continuousDays =
         new(StringComparer.OrdinalIgnoreCase);
 
-    public List<string> ListContentDays()
+    /// <param name="onlyCameras">Just these cameras' days (an account's limit); not cached.</param>
+    public List<string> ListContentDays(IReadOnlyCollection<string>? onlyCameras = null)
     {
-        lock (_daysGate)
-            if (_contentDays is { } c && DateTime.UtcNow - c.At < DaysCacheTtl)
-                return c.Days;
+        if (onlyCameras == null)
+            lock (_daysGate)
+                if (_contentDays is { } c && DateTime.UtcNow - c.At < DaysCacheTtl)
+                    return c.Days;
 
+        var dirs = onlyCameras?.Select(SafeName).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var days = new HashSet<string>(StringComparer.Ordinal);
         foreach (var root in Roots)
         {
             if (!Directory.Exists(root)) continue;
             foreach (var camDir in Directory.EnumerateDirectories(root))
+            {
+                if (dirs != null && !dirs.Contains(Path.GetFileName(camDir))) continue;
                 foreach (var dayDir in Directory.EnumerateDirectories(camDir))
                 {
                     var name = Path.GetFileName(dayDir)!;
                     if (IsDayName(name)) days.Add(name);
                 }
+            }
         }
         var result = days.OrderByDescending(d => d).ToList();
-        lock (_daysGate) _contentDays = (result, DateTime.UtcNow);
+        if (onlyCameras == null)
+            lock (_daysGate) _contentDays = (result, DateTime.UtcNow);
         return result;
     }
 

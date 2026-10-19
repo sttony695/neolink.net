@@ -143,6 +143,8 @@ public sealed class CameraService : ILiveCameraSource
         // Perimeter protection (line/zone crossing) token spellings seen or expected
         "crossline", "cross_line", "tripwire", "intrude", "intrusion", "region",
         "perimeter", "linger", "loiter", "loitering",
+        // Object left behind / taken away (firmware rule names)
+        "legacy", "loss",
     };
     private readonly HashSet<string> _reportedAiTypes = new(StringComparer.Ordinal);
     private volatile IBcCamera? _live;
@@ -158,6 +160,27 @@ public sealed class CameraService : ILiveCameraSource
     private volatile CancellationTokenSource? _activeStream; // the live session's CTS, to interrupt on suspend
     private bool _sleepHintLogged;
     private bool _scanLogged; // "wake-capture watching" said once
+    /// <summary>The camera resets this second connection at login while a sibling streams: one client at a time.</summary>
+    private bool _oneConnection;
+    private int _loginResets; // consecutive ones while a sibling streams; one or two are a transient
+    private static readonly TimeSpan OneConnectionRetry = TimeSpan.FromMinutes(5);
+    private volatile CancellationTokenSource? _oneConnWait; // the current one-connection wait, cut short by a sibling stopping
+
+    /// <summary>15 s doubling per further login reset, capped at 5 min: a transient
+    /// clears in under a minute, a true one-client camera settles at the cap.</summary>
+    internal static TimeSpan OneConnectionDelay(int loginResets)
+    {
+        int steps = Math.Clamp(loginResets - 3, 0, 5); // 15 s << 5 is already past the cap
+        var d = TimeSpan.FromSeconds(15 << steps);
+        return d < OneConnectionRetry ? d : OneConnectionRetry;
+    }
+
+    /// <summary>A sibling stream just stopped: its slot is free, so try now instead of waiting out the delay.</summary>
+    public void SiblingStopped()
+    {
+        if (!_oneConnection) return;
+        try { _oneConnWait?.Cancel(); } catch (ObjectDisposedException) { }
+    }
     // Wake-capture forensics (issue #44). A "self-wake" that is really OUR probe
     // waking the camera looks identical in the log to a real motion wake — both
     // read "camera woke itself". These carry the evidence that tells them apart
@@ -180,6 +203,7 @@ public sealed class CameraService : ILiveCameraSource
     // blind window right after a wake, where the ping scan is structurally deaf).
     // Ticks + detail are written from listener threads; the park loop consumes.
     private long _hintTicks;
+    private readonly Action<DateTime>? _persistWakeHint;
     private volatile string? _hintDetail;
     private DateTime _lastHintFire;
     /// <summary>Floor between hint-triggered connects. Scaled up by the fruitless-
@@ -197,7 +221,7 @@ public sealed class CameraService : ILiveCameraSource
     /// silently broken pipe can never blind the scan: no hint for this long and
     /// scan-only connects resume exactly as before. Hints refresh it; housekeeping
     /// wakes (no push) do not.</summary>
-    private static readonly TimeSpan HintTrustWindow = TimeSpan.FromHours(2);
+    private readonly TimeSpan _hintTrustWindow;
     private double _lastProbeMs;
     private bool _wakeClipStarted; // one wake clip per session, on the first keyframe
     // "Held awake by …" reporting: when it was last said, and when the current
@@ -217,18 +241,33 @@ public sealed class CameraService : ILiveCameraSource
     private static readonly TimeSpan ProbeEvery = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan ProbeWindow = TimeSpan.FromMinutes(15);
 
-    public CameraService(CameraConfig config, StreamKind kind, IMediaSink hub, TimeSpan startupDelay)
+    public CameraService(CameraConfig config, StreamKind kind, IMediaSink hub, TimeSpan startupDelay,
+        TimeSpan? hintTrustWindow = null, DateTime? lastWakeHintUtc = null,
+        Action<DateTime>? persistWakeHint = null)
     {
         _config = config;
         _kind = kind;
         _hub = hub;
         _demandHub = hub as IStreamHub;
         _startupDelay = startupDelay;
+        _hintTrustWindow = hintTrustWindow ?? TimeSpan.FromHours(WakeHintConfig.DefaultTrustHours);
+        _persistWakeHint = persistWakeHint;
+        // Restore trust only, not a fresh wake event (_hintDetail remains absent).
+        if (lastWakeHintUtc is { Kind: DateTimeKind.Utc } hint && hint <= DateTime.UtcNow)
+            _hintTicks = hint.Ticks;
     }
 
     public string Name => _config.Name;
     public StreamKind Kind => _kind;
     public IBcCamera? LiveCamera => _live;
+    /// <summary>Video frames are arriving on this stream's session.</summary>
+    public bool ReceivingMedia { get; private set; }
+    /// <summary>The sibling stream of this camera that is receiving media, by name; null when none (startup wiring).</summary>
+    public Func<string?>? StreamingSibling { get; set; }
+    /// <summary>Called when this stream stops receiving media (startup wiring: nudges the siblings).</summary>
+    public Action? MediaStopped { get; set; }
+    /// <summary>Told the camera's own service-port table once it is read (startup wiring).</summary>
+    public Action<IReadOnlyList<ServicePortState>>? ServicesAudited { get; set; }
 
     /// <summary>
     /// Exactly ONE service per camera runs the wake-capture probe loop (set during
@@ -287,7 +326,13 @@ public sealed class CameraService : ILiveCameraSource
     public void NotifyWakeHint(string source)
     {
         _hintDetail = source;
-        System.Threading.Interlocked.Exchange(ref _hintTicks, DateTime.UtcNow.Ticks);
+        var now = DateTime.UtcNow;
+        System.Threading.Interlocked.Exchange(ref _hintTicks, now.Ticks);
+        try { _persistWakeHint?.Invoke(now); }
+        catch (Exception ex)
+        {
+            Log.Warn($"{Tag}: could not persist wake hint timestamp ({ex.Message})");
+        }
     }
 
     /// <summary>True when the address is this camera — the configured host, or the
@@ -309,7 +354,37 @@ public sealed class CameraService : ILiveCameraSource
     // Sleep policy: explicit always_on wins; unset = battery cameras doze,
     // everything else streams around the clock (the pre-battery behavior). A live
     // keep-alive window suspends dozing entirely (see KeepAliveActive).
-    private bool AllowSleep => _demandHub != null && !(_config.AlwaysOn ?? !_batteryPowered) && !KeepAliveActive;
+    private bool AllowSleep => _demandHub != null && !(_config.AlwaysOn ?? !_batteryPowered)
+                               && !KeepAliveActive && !HoldAwake && DateTime.UtcNow.Ticks >= Volatile.Read(ref _holdUntilTicks);
+
+    private long _holdUntilTicks;
+
+    /// <summary>Holds the camera awake for <paramref name="span"/> (SD-card browsing): a parked
+    /// camera reconnects, a connected one stops dozing until the hold expires.</summary>
+    public void HoldAwakeFor(TimeSpan span)
+    {
+        long until = (DateTime.UtcNow + span).Ticks;
+        if (until > Volatile.Read(ref _holdUntilTicks)) Volatile.Write(ref _holdUntilTicks, until);
+    }
+
+    /// <summary>Held awake at runtime (emergency mode): the camera stops dozing for
+    /// as long as this is set, exactly like an open keep-alive window and with the
+    /// same battery cost. Cleared when emergency mode is switched off, after which
+    /// the standing sleep policy applies again. Volatile: it is set from the web
+    /// request / MQTT thread and read by the park loops.</summary>
+    public bool HoldAwake
+    {
+        get => Volatile.Read(ref _holdAwake);
+        set => Volatile.Write(ref _holdAwake, value);
+    }
+
+    private bool _holdAwake;
+
+    /// <summary>Does the park still hold? Leaving it because the sleep policy
+    /// changed under us (emergency mode) is as valid as leaving it for a viewer —
+    /// without this the camera stays parked and unreachable however loudly the
+    /// rest of the system says it is being held awake.</summary>
+    private bool ParkHolds => !DemandNow && AllowSleep;
 
     private readonly DateTime _serviceStartUtc = DateTime.UtcNow;
 
@@ -394,9 +469,18 @@ public sealed class CameraService : ILiveCameraSource
         DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastMotionActiveTicks) < MotionDemandHold.Ticks;
 
     // The router has recently proven it reports this camera's event pushes
-    // (see HintTrustWindow) — scan edges without a hint are then housekeeping.
-    private bool HintsLive =>
-        DateTime.UtcNow.Ticks - Interlocked.Read(ref _hintTicks) < HintTrustWindow.Ticks;
+    // (see _hintTrustWindow) — scan edges without a hint are then housekeeping.
+    private bool HintsLive => HintsLiveAt(DateTime.UtcNow.Ticks);
+
+    internal bool HintsLiveAt(long nowTicks) => IsHintTrusted(Interlocked.Read(ref _hintTicks), nowTicks);
+
+    internal bool IsHintTrusted(long hintTicks, long nowTicks) =>
+        hintTicks > 0 && nowTicks >= hintTicks && nowTicks - hintTicks < _hintTrustWindow.Ticks;
+
+    // Log wording for the hint age and trust window: minutes read best up to two
+    // hours, but a 72 h window as "4320 min" does not.
+    internal static string Span(TimeSpan t) =>
+        t.TotalHours < 2 ? $"{t.TotalMinutes:0} min" : $"{t.TotalHours:0.#} h";
 
     // A wake-opened session waiting for its detection (see WakeSessionLinger).
     // Anchored to the LATER of connect time and the last router hint: the camera
@@ -546,9 +630,20 @@ public sealed class CameraService : ILiveCameraSource
                         var diag = new WakeDiag { ParkedAt = DateTime.UtcNow, NonWakingScan = true };
                         bool sawAnyReply = false;
                         var lastLegacyProbe = DateTime.MinValue;
-                        while (!DemandNow)
+                        while (ParkHolds)
                         {
                             await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+                            if (!AllowSleep && !DemandNow)
+                            {
+                                // Emergency mode (or a keep-alive window) turned the
+                                // sleep policy off under us. Deliberately NOT counted
+                                // as a fruitless wake: this is our own doing, and
+                                // charging it to the wake scan would leave the camera
+                                // harder to wake long after the emergency is over.
+                                Log.Info($"{Tag}: held awake — reconnecting after " +
+                                         $"{(DateTime.UtcNow - diag.ParkedAt).TotalSeconds:0}s parked");
+                                break;
+                            }
                             if (DemandNow)
                             {
                                 // Left the park because OUR side wants the stream, not
@@ -643,10 +738,10 @@ public sealed class CameraService : ILiveCameraSource
                                     var hintAge = DateTime.UtcNow -
                                         new DateTime(System.Threading.Interlocked.Read(ref _hintTicks), DateTimeKind.Utc);
                                     Log.Info($"{Tag}: ping went flat (a scan-only build would call this a wake) " +
-                                             $"but the router — which reported an event push {hintAge.TotalMinutes:0} min " +
+                                             $"but the router — which reported an event push {Span(hintAge)} " +
                                              "ago — saw no push now: treating it as the camera's housekeeping wake and " +
                                              "staying parked; a wake hint connects us the moment a real event fires " +
-                                             $"(scan-only connects resume if no hint arrives for {HintTrustWindow.TotalMinutes:0} min)");
+                                             $"(scan-only connects resume if no hint arrives for {Span(_hintTrustWindow)})");
                                     rtt = new WakeRttDetector { ArmThreshold = rtt.ArmThreshold };
                                     continue;
                                 }
@@ -687,16 +782,16 @@ public sealed class CameraService : ILiveCameraSource
                         // and the awake time. This one connects only for a viewer.
                         Log.Info($"{Tag}: parked — the recording stream watches for self-wakes; " +
                                  "this stream connects when a viewer opens it");
-                        while (!DemandNow)
+                        while (ParkHolds)
                             await Task.Delay(500, ct).ConfigureAwait(false);
-                        Log.Info($"{Tag}: viewer waiting — reconnecting");
+                        Log.Info($"{Tag}: {(DemandNow ? "viewer waiting" : "held awake")} — reconnecting");
                     }
                     else
                     {
                         Log.Info($"{Tag}: parked — letting the battery camera sleep (open the stream to reconnect)");
-                        while (!DemandNow)
+                        while (ParkHolds)
                             await Task.Delay(500, ct).ConfigureAwait(false);
-                        Log.Info($"{Tag}: viewer waiting — reconnecting");
+                        Log.Info($"{Tag}: {(DemandNow ? "viewer waiting" : "held awake")} — reconnecting");
                     }
                 }
                 catch (OperationCanceledException)
@@ -768,11 +863,32 @@ public sealed class CameraService : ILiveCameraSource
                     _sleepHintLogged = true;
                     hint = " (a sleeping battery camera is unreachable until it wakes itself — PIR motion or the Reolink app)";
                 }
+                // A login reset while a sibling stream of the same camera is receiving media:
+                // the camera takes one client at a time (NVR-kit models), said once.
+                bool loginReset = !gotFrames && ex is IOException
+                                  && ex.Message.Contains($"waiting for message ID {Bc.BcConstants.MsgIdLogin}");
+                if (loginReset && StreamingSibling?.Invoke() is { } sibling && ++_loginResets >= 3)
+                {
+                    if (!_oneConnection)
+                        Log.Warn($"{Tag}: the camera resets this connection at login while its {sibling} stream is up: " +
+                                 "it allows one client at a time. Set this camera's Stream to the one stream you need " +
+                                 "(camera editor, or \"stream\": \"mainStream\" in config.json) to stop these retries; " +
+                                 $"meanwhile this stream is retried with growing waits up to {OneConnectionRetry.TotalMinutes:0} min, " +
+                                 "and at once when the other stream stops");
+                    _oneConnection = true;
+                }
+                else if (!loginReset)
+                {
+                    _oneConnection = false; // any other failure is an ordinary outage again
+                    _loginResets = 0;
+                }
                 // Privacy-mode churn (dark camera closing the connection) is expected
                 // and already announced once as a warning — keep the per-retry line at
                 // Debug so it doesn't flood the log.
                 if (_privacyLoop)
                     Log.Debug($"{Tag}: privacy reconnect: {Log.Flatten(ex)}; retrying in {backoff.TotalSeconds:0}s");
+                else if (_oneConnection)
+                    Log.Debug($"{Tag}: {Log.Flatten(ex)}; one-connection camera, retrying in {OneConnectionDelay(_loginResets).TotalSeconds:0}s");
                 else
                     Log.Error($"{Tag}: {Log.Flatten(ex)}; retrying in {backoff.TotalSeconds:0}s{hint}");
 
@@ -794,7 +910,19 @@ public sealed class CameraService : ILiveCameraSource
 
             try
             {
-                await Task.Delay(backoff, ct).ConfigureAwait(false);
+                if (_oneConnection)
+                {
+                    // The wait ends early when a sibling stream stops: that is the slot opening.
+                    using var nudge = new CancellationTokenSource();
+                    using var both = CancellationTokenSource.CreateLinkedTokenSource(ct, nudge.Token);
+                    _oneConnWait = nudge;
+                    try { await Task.Delay(OneConnectionDelay(_loginResets), both.Token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) when (nudge.IsCancellationRequested && !ct.IsCancellationRequested)
+                    { Log.Debug($"{Tag}: the other stream stopped; trying this one now"); }
+                    finally { _oneConnWait = null; }
+                }
+                else
+                    await Task.Delay(backoff, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -982,7 +1110,8 @@ public sealed class CameraService : ILiveCameraSource
         if (camera.RemoteIp is { } ip) _lastCameraIp = ip;
 
         Note($"{Tag}: logging in as '{_config.Username}'");
-        await camera.LoginAsync(_config.Username, _config.Password, ct).ConfigureAwait(false);
+        await camera.LoginAsync(_config.Username, _config.Password, ct,
+            BcLoginMode.From(_config.MaxEncryption, _config.LegacyLogin)).ConfigureAwait(false);
         var res = camera.DeviceInfo;
         Note($"{Tag}: logged in{(res != null && res.Width > 0 ? $", camera reports {res.Width}x{res.Height}" : "")}");
 
@@ -1023,6 +1152,7 @@ public sealed class CameraService : ILiveCameraSource
         _wakeClipStarted = false;
         if (!_servicesAudited)
             _ = Task.Run(() => AuditServicePortsAsync(camera, linked.Token), CancellationToken.None);
+        _ = Task.Run(() => CameraClock.MaybeSyncAsync(Name, camera, linked.Token), CancellationToken.None);
         Task? videoTask = null;
         // The status watch always runs: battery pushes keep the sidebar reading
         // fresh even without MQTT; other pushes go to the external sink if any.
@@ -1093,7 +1223,16 @@ public sealed class CameraService : ILiveCameraSource
                 Log.Info($"{Tag}: idle — nothing recording and nobody watching; holding a control-only " +
                          "connection (sensors and controls stay live, video starts when someone watches)");
                 while (!MediaWanted)
-                    await Task.Delay(250, linked.Token).ConfigureAwait(false);
+                {
+                    // No video stream here to notice a dead connection: watch for it directly (issue #62).
+                    await Task.WhenAny(Task.Delay(250, linked.Token), camera.Closed, pingTask ?? camera.Closed)
+                        .ConfigureAwait(false);
+                    linked.Token.ThrowIfCancellationRequested();
+                    if (camera.Closed.IsCompleted)
+                        throw new IOException($"connection lost while idle ({camera.Closed.Result})");
+                    if (pingTask is { IsCompleted: true })
+                        throw new IOException("the camera stopped answering pings while idle");
+                }
                 Log.Info($"{Tag}: {(DemandNow ? "viewer asked" : "recording switched on")} — starting the video stream");
             }
 
@@ -1132,6 +1271,9 @@ public sealed class CameraService : ILiveCameraSource
                 if (++frames == 1)
                 {
                     Log.Info($"{Tag}: receiving media");
+                    ReceivingMedia = true;
+                    _oneConnection = false;
+                    _loginResets = 0;
                     // Media flowing = definitely not private. Heals a stale flag
                     // when the wake happened while we were reconnecting (the
                     // "off" push can be missed across a connection swap).
@@ -1243,6 +1385,9 @@ public sealed class CameraService : ILiveCameraSource
         finally
         {
             _live = null;
+            bool wasReceiving = ReceivingMedia;
+            ReceivingMedia = false;
+            if (wasReceiving) MediaStopped?.Invoke();
             _activeStream = null;
             _hub.SourceStopped(); // stale GOP must not prime viewers while we're down
             ReportWakeDiag();
@@ -1369,8 +1514,12 @@ public sealed class CameraService : ILiveCameraSource
             false => $"the camera said AWAKE {d.SleepStatusMs:0}ms after connect (it was already up)",
             _ => "the camera never sent a sleepStatus push",
         };
-        Log.Info($"{Tag}: [wake-diag] {d.Verdict(WakeProbeTimeout.TotalMilliseconds)}. " +
-                 $"Evidence: {edge} " +
+        // The happy case is one short line; the evidence only matters when something is off.
+        if (d.SawDetection)
+            Log.Info($"{Tag}: self-wake caught{(d.HintSource != null ? " (router wake hint)" : "")}: a detection followed");
+        else
+            Log.Info($"{Tag}: [wake-diag] {d.Verdict(WakeProbeTimeout.TotalMilliseconds)}.");
+        Log.Debug($"{Tag}: [wake-diag] evidence: {edge} " +
                  $"({d.ProbesTotal} probes this park, slowest answer {d.SlowestAnsweredMs:0}ms of a " +
                  $"{WakeProbeTimeout.TotalMilliseconds:0}ms timeout); " +
                  $"{d.UnansweredSummary(WakeProbeTimeout.TotalMilliseconds)}; {sleepSaid}; " +
@@ -1406,13 +1555,14 @@ public sealed class CameraService : ILiveCameraSource
         }
     }
 
-    /// <summary>Session-activity ping for UDP cameras: msg 93 every 5 s, like the
-    /// official client. An unanswered ping is logged once and pinging continues —
-    /// the request is what proves the client alive; a dead connection is noticed
-    /// by the video stream, which tears the session down.</summary>
+    private const int MaxMissedPings = 3;
+
+    /// <summary>Session-activity ping (msg 93 every 5 s, like the official client). A firmware that never
+    /// answers is tolerated; over TCP, one that answered and then misses three in a row ends the loop (issue #62).</summary>
     private async Task PingLoopAsync(IBcCamera camera, CancellationToken ct)
     {
-        bool quiet = false;
+        bool quiet = false, answered = false;
+        int missed = 0;
         while (!ct.IsCancellationRequested)
         {
             try { await Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false); }
@@ -1420,10 +1570,17 @@ public sealed class CameraService : ILiveCameraSource
             try
             {
                 await camera.PingAsync(ct).ConfigureAwait(false);
+                answered = true;
+                missed = 0;
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex)
             {
+                if (answered && !_config.Udp && ++missed >= MaxMissedPings)
+                {
+                    Log.Debug($"{Tag}: {missed} pings unanswered in a row ({ex.Message}) — giving up on pings");
+                    return;
+                }
                 if (!quiet)
                 {
                     quiet = true;
@@ -1490,6 +1647,7 @@ public sealed class CameraService : ILiveCameraSource
             _servicesAudited = true;
             Log.Info($"{Tag}: camera services (live): " + string.Join(" · ", ports.Select(s =>
                 $"{s.Service} {s.Port?.ToString() ?? "?"}{(s.Enabled == false ? " OFF" : "")}")));
+            ServicesAudited?.Invoke(ports);
             // Missing block or no enable flag = not provably off — never warn on those.
             bool Off(string svc) => ports.FirstOrDefault(s => s.Service == svc)?.Enabled == false;
             bool httpUsable = !Off("http") || !Off("https");

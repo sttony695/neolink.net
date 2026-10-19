@@ -124,6 +124,12 @@ worker, drops its caches, and refetches everything from the server bypassing
 the HTTP cache — the way out when a server update leaves the app shell showing
 a stale UI.
 
+If the page itself locks up — every click ignored, video frozen, even F5 doing
+nothing — the shell notices within about half a minute, ends the page's browser
+process and reloads it; the window stays open and the tray keeps alerting
+throughout. A page that keeps locking up is left on the error screen after the
+fourth time in ten minutes, with Retry to try again.
+
 ## Notifications
 
 The settings window splits into two halves, and which half a setting is in
@@ -133,7 +139,8 @@ matters:
 and the browser agrees, and the other way round):
 
 - which cameras alert, and for which detections (person, vehicle, animal,
-  package, doorbell, crying, line-crossing, intrusion, loitering, motion)
+  package, doorbell, crying, line-crossing, intrusion, loitering, object-left,
+  object-taken, motion)
 - per-camera **offline** alerts
 - server alerts: storage full, server overloaded, recording write failures
 - the repeat cooldown

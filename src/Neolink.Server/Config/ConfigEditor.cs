@@ -1,6 +1,7 @@
 ﻿// Copyright (c) 2026 Oluwabori Olaleye
 // Licensed under the GNU Affero General Public License v3.0; see the LICENSE file
 // in the repository root.
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -12,26 +13,41 @@ namespace Neolink.Config;
 /// candidate is validated through the normal <see cref="NeolinkConfig.Load"/>
 /// before it replaces the file (atomically, keeping a .bak of the previous
 /// version). Comments do NOT survive a rewrite — the UI says so.
-/// RTSP users are deliberately not editable here (credentials in a list deserve
-/// a text editor); cameras ARE editable via the camera helpers below, with
-/// passwords handled write-only by the API layer.
+/// Cameras and RTSP users are editable via the helpers below; their passwords
+/// are handled write-only by the API layer.
 /// </summary>
 public static class ConfigEditor
 {
     private static readonly JsonSerializerOptions WriteOpts = new() { WriteIndented = true };
     private static readonly object Gate = new();
 
-    public static bool IsWritable(string path)
+    public static bool IsWritable(string path) => WriteProblem(path) == null;
+
+    /// <summary>Why the file can't be opened for writing, in words an admin can act on; null when it can.</summary>
+    public static string? WriteProblem(string path)
     {
         try
         {
             using var _ = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
-            return true;
+            return null;
         }
-        catch
+        catch (FileNotFoundException) { return "the file does not exist"; }
+        catch (DirectoryNotFoundException) { return "its folder does not exist"; }
+        catch (UnauthorizedAccessException)
         {
-            return false;
+            string mode = "";
+            try { if (!OperatingSystem.IsWindows()) mode = $", mode {Convert.ToString((int)File.GetUnixFileMode(path), 8)}"; }
+            catch { }
+            bool readable = false;
+            try { using var _ = File.OpenRead(path); readable = true; } catch { }
+            return $"permission denied for the server's user '{Environment.UserName}'{mode}" +
+                   (readable ? "" : ", and it cannot be read either");
         }
+        catch (IOException ex) when (ex.Message.Contains("read-only", StringComparison.OrdinalIgnoreCase))
+        {
+            return "the file system is mounted read-only";
+        }
+        catch (Exception ex) { return ex.Message; }
     }
 
     /// <summary>The editable settings, read fresh from the file.
@@ -57,6 +73,7 @@ public static class ConfigEditor
         {
             path = Path.GetFullPath(path),
             writable = IsWritable(path),
+            writeProblem = WriteProblem(path),
             encryption,
             settings = new
             {
@@ -113,6 +130,11 @@ public static class ConfigEditor
                     syslogPort = cfg.WakeHints.SyslogPort,
                     pushPorts = string.Join(", ", cfg.WakeHints.PushPorts),
                     bind = cfg.WakeHints.Bind,
+                    // The default reads as blank, like the other "blank = …" fields;
+                    // an explicit 2 is the same setting.
+                    trustHours = cfg.WakeHints.TrustHours == WakeHintConfig.DefaultTrustHours
+                        ? (double?)null
+                        : cfg.WakeHints.TrustHours,
                 },
             },
         };
@@ -151,15 +173,24 @@ public static class ConfigEditor
                 AllowTrailingCommas = true,
             }) as JsonObject ?? throw new FormatException("config root must be a JSON object");
 
+            // strict: a camera the loader would merely SKIP at boot has to be refused
+            // here, or the editor accepts it and it vanishes next start. But only ever
+            // as strict as the file being REPLACED — a config that already holds an
+            // unusable entry (the add-on can write one) would otherwise fail every
+            // save, including the ones that would have removed it.
+            bool strict = true;
+            try { NeolinkConfig.Load(path, strict: true); }
+            catch (FormatException) { strict = false; }
+            catch { /* unreadable for another reason: the mutation below decides */ }
+
             mutate(root);
 
-            // Validate the candidate exactly the way startup would.
             var candidate = root.ToJsonString(WriteOpts);
             var tmp = path + ".tmp";
             File.WriteAllText(tmp, candidate);
             try
             {
-                NeolinkConfig.Load(tmp); // throws FormatException on anything invalid
+                NeolinkConfig.Load(tmp, strict);
             }
             catch
             {
@@ -186,6 +217,51 @@ public static class ConfigEditor
             obj[key] = value;
     }
 
+    /// <summary>True when a wake_hints section holds nothing but trust_hours (any
+    /// spelling), or nothing at all. The loader reads such a section as "syslog on
+    /// 5140", which nobody who only tuned the trust window asked for.</summary>
+    public static bool OnlyTrustHoursLeft(JsonObject wakeHints) =>
+        wakeHints.All(kv => kv.Key.Replace("_", "").Replace("-", "").ToLowerInvariant() == "trusthours");
+
+    /// <summary>Applies the settings page's wake-hint edit to the config root. Null
+    /// fields are untouched; empty push ports / bind / trust hours remove those keys
+    /// (the trust window then falls back to its default). Range checks are left to
+    /// the loader's validation of the candidate. Throws <see cref="FormatException"/>
+    /// on a bad port list or trust value, or when a trust window is set with no
+    /// hint source for it to tune.</summary>
+    public static void ApplyWakeHintEdit(JsonObject root, int? syslogPort, string? pushPorts, string? bind,
+        string? trustHours)
+    {
+        if (syslogPort == null && pushPorts == null && bind == null && trustHours == null) return;
+        double? trust = null;
+        if (!string.IsNullOrWhiteSpace(trustHours))
+            trust = double.TryParse(trustHours.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var h)
+                    && double.IsFinite(h)
+                ? h
+                : throw new FormatException("wake_hints.trust_hours must be a number");
+        var wh = Section(root, "wake_hints");
+        if (syslogPort != null) Set(wh, "syslog_port", syslogPort);
+        if (pushPorts != null)
+        {
+            var ports = ParsePortList(pushPorts);
+            Set(wh, "push_ports", ports.Count == 0
+                ? null
+                : new JsonArray(ports.Select(p => (JsonNode)p).ToArray()));
+        }
+        if (bind != null) Set(wh, "bind", bind.Length == 0 ? null : bind);
+        if (trustHours != null) Set(wh, "trust_hours", trust);
+        // An empty section would quietly enable the syslog default (5140); an
+        // all-cleared edit means "no wake hints" instead. trust_hours tunes the
+        // listeners but is not one, so a section holding only it counts as empty.
+        if (OnlyTrustHoursLeft(wh))
+        {
+            if (trust != null)
+                throw new FormatException("The hint trust window needs a hint source: set a router " +
+                                          "syslog port (0 = API hints only) or push decoy ports.");
+            Set(root, "wake_hints", null);
+        }
+    }
+
     /// <summary>The (possibly differently-spelled) child object for a section, created on demand.</summary>
     public static JsonObject Section(JsonObject root, string key)
     {
@@ -210,20 +286,48 @@ public static class ConfigEditor
         return null;
     }
 
+    // ------------------------------------------------------------------ RTSP users
+
+    /// <summary>The top-level RTSP "users" array (any key spelling), created on demand.</summary>
+    public static JsonArray RtspUsers(JsonObject root) => TopLevelArray(root, "users");
+
+    /// <summary>One RTSP user entry by exact name; the loader reads "name" or "username".</summary>
+    public static JsonObject? FindRtspUser(JsonArray users, string name) =>
+        users.OfType<JsonObject>().FirstOrDefault(u => (GetString(u, "name") ?? GetString(u, "username")) == name);
+
+    /// <summary>Stores the password as "pass", dropping the "password" spelling the loader also reads.</summary>
+    public static void SetRtspPassword(JsonObject user, string password)
+    {
+        Set(user, "password", null);
+        Set(user, "pass", password);
+    }
+
+    /// <summary>Why a new RTSP username is unusable in a login or an rtsp:// URL; null when fine.</summary>
+    public static string? RtspUserNameError(string name)
+    {
+        if (name.Length is 0 or > 64) return "username is required (max 64 characters)";
+        if (name.Any(ch => char.IsWhiteSpace(ch) || char.IsControl(ch) || ":@/\\".Contains(ch)))
+            return "username must not contain spaces or : @ / \\";
+        return null;
+    }
+
     // ------------------------------------------------------------------ cameras
 
     /// <summary>The cameras array (any key spelling), created on demand.</summary>
-    public static JsonArray Cameras(JsonObject root)
+    public static JsonArray Cameras(JsonObject root) => TopLevelArray(root, "cameras");
+
+    /// <summary>A top-level array (any key spelling), created on demand.</summary>
+    private static JsonArray TopLevelArray(JsonObject root, string key)
     {
         string Normalized(string k) => k.Replace("_", "").Replace("-", "").ToLowerInvariant();
         foreach (var kv in root)
         {
-            if (Normalized(kv.Key) == "cameras" && kv.Value is JsonArray existing)
+            if (Normalized(kv.Key) == key && kv.Value is JsonArray existing)
                 return existing;
         }
-        var cams = new JsonArray();
-        root["cameras"] = cams;
-        return cams;
+        var array = new JsonArray();
+        root[key] = array;
+        return array;
     }
 
     /// <summary>One camera entry by name (case-insensitive, any key spelling).</summary>
@@ -266,17 +370,71 @@ public static class ConfigEditor
         return null;
     }
 
-    /// <summary>An RTSP URL safe to show in the UI: the userinfo password (if any)
-    /// is replaced with ****. Round-trip contract: a client that sends the masked
-    /// value back means "keep the stored one".</summary>
+    /// <summary>Replaces the password in a "scheme://user:pass@host" URL (or a bare "user:pass@host:port")
+    /// with ****; a client sending the mask back means "keep the stored one" (<see cref="UnmaskPassword"/>).</summary>
     public static string? MaskRtspPassword(string? url)
     {
-        if (string.IsNullOrEmpty(url)) return url;
-        int at = url.IndexOf('@');
+        if (LoginSpan(url) is not { } s || s.PassStart < 0) return url;
+        return url![..s.PassStart] + Mask + url[s.At..];
+    }
+
+    /// <summary>What a stored password is shown as.</summary>
+    public const string Mask = "****";
+
+    /// <summary>
+    /// Undoes <see cref="MaskRtspPassword"/> on a value an admin has EDITED: wherever
+    /// the edited value still carries the mask, the stored password goes back in its
+    /// place. Without this, changing the host or path of a URL whose password is
+    /// shown masked either stored the literal mask (destroying the password) or was
+    /// quietly thrown away. Returns null when there is nothing to restore it from,
+    /// so the caller keeps the stored value rather than writing a mask.
+    /// </summary>
+    public static string? UnmaskPassword(string edited, string? stored)
+    {
+        if (!edited.Contains(Mask, StringComparison.Ordinal)) return edited;
+        if (LoginSpan(edited) is not { PassStart: >= 0 } e
+            || edited[e.PassStart..e.At] != Mask
+            || LoginSpan(stored) is not { PassStart: >= 0 } s)
+            return null;
+        return edited[..e.PassStart] + stored![s.PassStart..s.At] + edited[e.At..];
+    }
+
+    /// <summary>Where the password sits inside a "scheme://user:pass@host/path" or a
+    /// bare "user:pass@host:port": PassStart is its first character (-1 when there
+    /// is a user but no password), At is the '@' that ends the login. The login ends
+    /// at the LAST '@' inside the authority — which is how a URL parser reads it, and
+    /// so how the camera sees it — because an '@' in a password is common and people
+    /// do not percent-escape it. Null when the value carries no login at all.</summary>
+    internal static (int PassStart, int At)? LoginSpan(string? url)
+    {
+        if (string.IsNullOrEmpty(url)) return null;
         int scheme = url.IndexOf("://", StringComparison.Ordinal);
-        if (at < 0 || scheme < 0 || at < scheme) return url;
-        int colon = url.IndexOf(':', scheme + 3);
-        if (colon < 0 || colon > at) return url; // no password part
-        return url[..(colon + 1)] + "****" + url[at..];
+        int start = scheme < 0 ? 0 : scheme + 3;
+        int end = url.IndexOfAny(new[] { '/', '?', '#' }, start);
+        if (end < 0) end = url.Length;
+        if (end <= start) return null; // no authority to hold a login
+        int at = url.LastIndexOf('@', end - 1, end - start);
+        if (at < start)
+        {
+            // A raw '/', '?' or '#' in the password puts the '@' after it ("user:pa#ss@host"):
+            // unless what precedes it is "host:port", the login runs on to the last '@'.
+            int colonBefore = url.IndexOf(':', start, end - start);
+            if (colonBefore < 0 || end == url.Length) return null;
+            // An IPv6 literal's own colons ("[fe80::1]:554") are not a login's.
+            int bracket = url.IndexOf('[', start, end - start);
+            if (bracket >= 0 && bracket < colonBefore) return null;
+            bool port = int.TryParse(url.AsSpan(colonBefore + 1, end - colonBefore - 1), out _);
+            if (port) return null;
+            // An '@' in the query or fragment is not the login's: after a '/' those start at the
+            // '?' or '#'; after a '?' or '#' in the password, the login ends before the first '/'.
+            int stop = url[end] == '/' ? url.IndexOfAny(new[] { '?', '#' }, end) : url.IndexOf('/', end);
+            if (stop < 0) stop = url.Length;
+            at = url.LastIndexOf('@', stop - 1, stop - start);
+            // No '@' before that '/': the password holds one too, and the login runs on to the last '@'.
+            if (at < end && url[end] != '/' && stop < url.Length) at = url.LastIndexOf('@');
+            if (at < end) return null;
+        }
+        int colon = url.IndexOf(':', start, at - start);
+        return (colon < 0 ? -1 : colon + 1, at);
     }
 }

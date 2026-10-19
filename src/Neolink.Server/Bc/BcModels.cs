@@ -13,6 +13,11 @@ namespace Neolink.Bc;
 public static class BcConstants
 {
     public const uint MagicHeader = 0x0abcdef0;
+    /// <summary>Older firmware (Reolink IPC_36S8M) heads snapshot replies with the
+    /// descending twin of <see cref="MagicHeader"/>. Reference neolink calls it
+    /// MAGIC_HEADER_REV and accepts either; the rest of the header is unchanged.
+    /// Only <see cref="MagicHeader"/> is ever sent.</summary>
+    public const uint MagicHeaderRev = 0x0fedcba0;
 
     public const uint MsgIdLogin = 1;
     public const uint MsgIdLogout = 2;
@@ -26,7 +31,7 @@ public static class BcConstants
     public const uint MsgIdSetServicePorts = 36;   // write ONE modified element back (Port Settings)
     public const uint MsgIdGetServicePorts = 37;   // reply: ServerPort/HttpPort/HttpsPort/RtspPort/RtmpPort/OnvifPort
     public const uint MsgIdMotion = 33;
-    public const uint MsgIdGetAbilitySupport = 58;
+    public const uint MsgIdGetAbilitySupport = 58;     // firmware name: GET_USERCFG_V20 (<UserList>)
     public const uint MsgIdVersion = 80;
     public const uint MsgIdPing = 93;
     public const uint MsgIdGetGeneral = 104;
@@ -47,11 +52,48 @@ public static class BcConstants
     public const uint MsgIdBatteryInfo = 253;
     public const uint MsgIdPlayAudio = 263;            // "audioPlayInfo" — manual siren trigger
     public const uint MsgIdFloodlightManual = 288;
+    public const uint MsgIdFloodlightTasksGet = 289;   // GET_FLOODLIGHT_TASK in every Linux IPC firmware
     public const uint MsgIdFloodlightTasksWrite = 290;
     public const uint MsgIdFloodlightStatusList = 291;
     public const uint MsgIdGetZoomFocus = 294;
     public const uint MsgIdSetZoomFocus = 295;
-    public const uint MsgIdFloodlightTasksRead = 438;
+    public const uint MsgIdFloodlightTasksRead = 438;  // reference neolink's id; absent from IPC firmware tables
+
+    // SD card (FileInfoList / DayRecords bodies).
+    public const uint MsgIdDownload = 8;
+    public const uint MsgIdDownloadStop = 9;
+    public const uint MsgIdSearchOpen = 14;
+    public const uint MsgIdSearchFile = 15;
+    public const uint MsgIdSearchClose = 16;
+    public const uint MsgIdGetDayRecords = 142;
+
+    // Device settings recovered from the firmware command tables.
+    public const uint MsgIdGetShelter = 52;        // <Shelter>: privacy masks
+    public const uint MsgIdSetShelter = 53;
+    public const uint MsgIdGetPtzCruise = 64;
+    public const uint MsgIdGetRecordEnable = 81;   // <Record>: SD recording master switch
+    public const uint MsgIdSetRecordEnable = 82;
+    public const uint MsgIdSetAutoReboot = 100;    // <AutoReboot>
+    public const uint MsgIdGetHdd = 102;           // <HddInfoList>: SD cards
+    public const uint MsgIdGetAutoReboot = 101;
+    public const uint MsgIdSetGuard = 331;         // <PtzGuard>
+    public const uint MsgIdGetGuard = 332;
+    public const uint MsgIdDingdongList = 484;     // <dingdongList>: paired chimes
+    public const uint MsgIdDingdongDeviceOpt = 485; // <dingdongDeviceOpt>: per-chime get/set/ring
+    public const uint MsgIdGetCrossline = 527;     // <CrosslineDetect>; each SET is GET + 1
+    public const uint MsgIdGetIntrusion = 529;     // <IntrusionDetect>
+    public const uint MsgIdGetLoitering = 531;     // <LoiteringDetect>
+    public const uint MsgIdGetLegacy = 549;        // <LegacyDetect>: object left behind
+    public const uint MsgIdGetLoss = 551;          // <LossDetect>: object taken
+    public const uint MsgIdGetDingdongSilent = 609; // <dingdongSilentMode>
+    public const uint MsgIdSetDingdongSilent = 610;
+    public const uint MsgIdSetVideoInput = 25;     // <VideoInput>: picture sliders, 0-255
+    public const uint MsgIdGetVideoInput = 26;
+    public const uint MsgIdGetPtzPreset = 190;     // <PtzPreset>: saved slots only; 19 goes/saves
+    public const uint MsgIdGetAudioCfg = 264;      // <audioCfg>: speaker volume
+    public const uint MsgIdSetAudioCfg = 265;
+    public const uint MsgIdGetAiDetectCfg = 342;   // <AiDetectCfg>: per-type AI sensitivity and zone
+    public const uint MsgIdSetAiDetectCfg = 343;
     public const uint MsgIdNetInfo = 464;
     public const uint MsgIdSleepState = 574;           // privacy-mode read (reply carries <sleep>)
     public const uint MsgIdSetSleepState = 575;        // privacy-mode write (<sleepState> body)
@@ -77,11 +119,30 @@ public static class BcConstants
 
     // Legacy "login upgrade" request: the response_code advertises the highest
     // encryption scheme the client supports. The camera replies with the scheme it
-    // will actually use plus a login nonce. Advertise AES: modern (post-2021)
-    // cameras are AES-only and drop the connection if the client can't do AES.
+    // will actually use plus a login nonce. The default advertises FullAes: modern
+    // (post-2021) cameras are AES-only and drop the connection if the client can't
+    // do AES. The low byte is the same scheme byte the reply comes back with, so
+    // these are the four tiers EncryptionKind names.
     public const ushort LegacyUpgradeNone = 0xdc00;
     public const ushort LegacyUpgradeBcEncrypt = 0xdc01;
-    public const ushort LegacyUpgradeAes = 0xdc12;
+    public const ushort LegacyUpgradeAes = 0xdc02;
+    public const ushort LegacyUpgradeFullAes = 0xdc12;
+
+    /// <summary>The per-camera "max_encryption" names, in ascending order.</summary>
+    public static readonly string[] MaxEncryptionNames = { "none", "bcencrypt", "aes", "fullaes" };
+
+    /// <summary>Resolves a "max_encryption" name to its upgrade code. Null/empty is
+    /// the default (FullAes); an unrecognised name returns null so the config loader
+    /// can reject it by name rather than silently falling back.</summary>
+    public static ushort? ParseMaxEncryption(string? name) => name?.Trim().ToLowerInvariant() switch
+    {
+        null or "" => LegacyUpgradeFullAes,
+        "none" => LegacyUpgradeNone,
+        "bcencrypt" => LegacyUpgradeBcEncrypt,
+        "aes" => LegacyUpgradeAes,
+        "fullaes" => LegacyUpgradeFullAes,
+        _ => null,
+    };
 
     /// <summary>An empty password in the legacy login format: 32 NUL bytes.</summary>
     public static readonly string EmptyLegacyPassword = new('\0', 32);

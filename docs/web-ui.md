@@ -43,11 +43,48 @@ brightness, PIR, a latched siren, privacy mode and reboot. Over the camera's
 HTTP API (beta) it adds picture sliders, day/night and anti-flicker, HDR,
 speaker volume, motion and per-type AI detection sensitivity, the on-screen
 display, PTZ presets, doorbell quick replies and a firmware-update badge.
+Over Baichuan (beta, no HTTP API needed) it adds the SD-recording switch,
+automatic reboot, PTZ guard position and patrols, privacy masks, doorbell
+chimes (volume, light, silent mode) and smart-detection rule sensitivity;
+these apply at once. A camera without an HTTP API also gets its picture
+sliders, speaker volume, PTZ presets and AI sensitivity over Baichuan.
 Device settings **stage** and are sent only on "Apply to camera", with an
 up-front warning when a change restarts the stream or reboots the camera.
 The **PORTS tab** shows the camera's own service switches (HTTP, HTTPS,
 RTSP, ONVIF…) read live, and can enable HTTP/ONVIF right from Neolink
 (admin only, behind a confirmation).
+
+**Non-Reolink (generic RTSP) cameras** get the same panel, built over
+**ONVIF** instead: model/firmware/serial on the identity strip, the media
+profiles' resolution/framerate/bitrate (over Media or the newer Media2), the
+imaging sliders with day/night, pan/tilt with saved presets (only when the
+head really pans and tilts), an optical-zoom slider, where the name and
+timestamp overlays sit, and reboot. Their **detections** come over ONVIF's event service, so event
+recording, notifications, the events page and Home Assistant's motion sensors
+all work for them too.
+Each section appears only if that camera's ONVIF services answer for
+it; what ONVIF cannot do is left out rather than offered and refused (it can
+move an overlay but not switch it off, and there is no ONVIF hue,
+anti-flicker, flip/mirror, HDR or single focus slider). There is no PORTS tab — that table is
+Baichuan's. A camera with ONVIF switched off still streams and records; its
+panel just shows less. See the README for where ONVIF is looked for and how
+to point it somewhere else.
+
+### Detection zone
+
+Every camera has one, behind **Edit zone…**: drag boxes over the camera's
+own picture to mark what is worth watching, in Block or Watch mode, then
+apply. Where it is KEPT depends on the camera and the editor says which —
+**on the camera** for a Reolink with its HTTP API (the same grid the Reolink
+app edits, governing the camera's own motion and AI alarms) and for a
+non-Reolink camera whose ONVIF analytics runs a cell motion detector (its own
+motion grid, which governs its motion alarms only), or **on Neolink** for any
+camera that keeps no zone of its own (generic RTSP without such a detector,
+and Reolink models whose firmware carries no grid). A Neolink-kept zone writes
+nothing to the camera and leaves its own alerts alone; it governs what
+Neolink watches — today, the live object boxes. Cameras with no snapshot
+command of their own get the editor's backdrop from the stream Neolink is
+already carrying, decoded with ffmpeg.
 
 ## Events, timeline, export
 
@@ -76,16 +113,22 @@ RTSP, ONVIF…) read live, and can enable HTTP/ONVIF right from Neolink
   original segments. The dialog pre-fills the zoomed window and shows the
   size first; mind that a full high-bitrate day is tens of gigabytes.
 
-## Camera SD-card playback (preview)
+## Camera SD-card playback (beta)
 
 The Events page's **SD card** mode lists and plays the recordings a camera
 stored on its own card — footage from when the server was down, and
 battery-camera clips that never streamed. Day calendar from the camera,
-playback with scrubbing, download. Needs the camera's HTTP API and a mounted
-card; what the camera records onto its card is configured in the Reolink
-app. *Preview* because it hangs on per-model firmware: the Video Doorbell
-WiFi lists recordings its firmware cannot serve (those clips only play in
-the Reolink app, and the player says so).
+playback with scrubbing, download. Uses the camera's HTTP API, or Baichuan
+when it has none or won't serve a clip; what the camera records onto its card
+is configured in the Reolink app. A Video Doorbell serves clips over HTTP only
+with RTMP enabled (Ports tab); otherwise they come over Baichuan, which needs
+ffmpeg. Encrypted recordings ask for the recording password.
+
+On the timeline, the **SD card** switch (beta, off by default, remembered per
+account like **Events only**) plays a battery camera's own copy of each event
+for the seconds before Neolink's recording began, and draws a thin strip along each lane's
+foot for everything the card holds that day (a sleeping camera is not woken for it).
+See [battery cameras](battery-cameras.md).
 
 ## Install as an app (PWA)
 

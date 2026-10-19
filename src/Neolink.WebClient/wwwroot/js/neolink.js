@@ -7,6 +7,9 @@
     // asked for audio, and unmuted autoplay is usually blocked anyway. Any real
     // interaction before playback (clicking an event row) keeps sound on.
     let userGestureSeen = false;
+    // This file's own URL, so a sibling script can be loaded on demand with the
+    // same cache-busting version and behind the same path prefix (HA ingress).
+    const ownSrc = (document.currentScript && document.currentScript.src) || '';
     for (const evt of ['pointerdown', 'keydown', 'touchstart'])
         window.addEventListener(evt, () => { userGestureSeen = true; },
             { once: true, capture: true, passive: true });
@@ -156,7 +159,7 @@
             // "codec not supported" for every codec.
             const MS = window.ManagedMediaSource || window.MediaSource;
             if (!MS) {
-                this.setStatus('⚠ this browser has no Media Source support — live view needs Safari 17.1+/iOS 17.1+ or any Chromium/Firefox');
+                this.setStatus('⚠ this browser has no Media Source support; live view needs Safari 17.1+/iOS 17.1+ or any Chromium/Firefox');
                 this.alive = false;
                 try { this.ws.close(); } catch { }
                 return;
@@ -477,12 +480,12 @@
         const starved = s.ws === 1 && s.hop === 0 && dropPct < 2 && s.session > 20
             && s.maxGap != null && s.maxGap >= 3 && avgBps > 0 && avgBps < 400_000 && s.frames > 0;
 
-        let verdict = 'healthy — picture is arriving and decoding cleanly', vcls = 'ok';
-        if (s.ws !== 1) { verdict = `link ${WS_STATE[s.ws]} — trying to reconnect`; vcls = 'bad'; }
-        else if (dropPct >= 2) { verdict = 'this device is dropping frames — try the sub stream or close other tiles'; vcls = 'bad'; }
-        else if (s.hop > 0) { verdict = 'footage went missing before it reached the browser — server or network, not this device'; vcls = 'warn'; }
-        else if (starved) { verdict = 'the camera is sending less video than the stream needs — its radio can’t keep up with its encoder (known on some battery models); not this device or network'; vcls = 'warn'; }
-        else if (!s.live) { verdict = 'buffering — waiting for enough video to start'; vcls = 'warn'; }
+        let verdict = 'healthy: picture is arriving and decoding cleanly', vcls = 'ok';
+        if (s.ws !== 1) { verdict = `link ${WS_STATE[s.ws]}, trying to reconnect`; vcls = 'bad'; }
+        else if (dropPct >= 2) { verdict = 'this device is dropping frames; try the sub stream or close other tiles'; vcls = 'bad'; }
+        else if (s.hop > 0) { verdict = 'footage went missing before it reached the browser: server or network, not this device'; vcls = 'warn'; }
+        else if (starved) { verdict = 'the camera is sending less video than the stream needs; its radio can’t keep up with its encoder (known on some battery models); not this device or network'; vcls = 'warn'; }
+        else if (!s.live) { verdict = 'buffering: waiting for enough video to start'; vcls = 'warn'; }
         else if (s.rate > 1.001) { verdict = 'playing slightly fast to drift back toward live'; vcls = 'warn'; }
 
         st.el.querySelector('.nerd-rows').innerHTML = rows.map(([k, v, cls]) =>
@@ -500,7 +503,7 @@
         vEl.className = 'nerd-verdict ' + vcls;
 
         // Kept ready so "copy" is instant — a paste-ready report for an issue.
-        st.text = [`neolink.net — live stream stats (${new Date().toISOString()})`,
+        st.text = [`neolink.net · live stream stats (${new Date().toISOString()})`,
             ...rows.map(([k, v]) => `${k.padEnd(14)}${v}`),
             `verdict       ${verdict}`,
             `browser       ${navigator.userAgent}`].join('\n');
@@ -713,6 +716,46 @@
             }
             const p = o.player;
             if (p) this.eventPlayer(p.id, p.url, p.rate, p.fallback, p.autoplay, p.ongoing);
+            // Zones first: the detector must never draw a box before it knows
+            // which part of the view the camera is set to watch.
+            if (o.detectZones) this.detectZones(o.detectZones);
+            this.detect(o.detect || null);
+        },
+
+        // Live object boxes (preview). The detector is a separate script that is
+        // fetched the first time it is actually wanted, so a server with the
+        // feature off never downloads a byte of it. `cfg` is null whenever boxes
+        // should not be drawn — which is every view except one camera on its own.
+        detect(cfg) {
+            this._detectWant = cfg;
+            if (window.neolinkDetect) { window.neolinkDetect.sync(cfg); return; }
+            if (!cfg || this._detectLoading || !ownSrc) return;
+            this._detectLoading = true;
+            const el = document.createElement('script');
+            el.src = ownSrc.replace(/neolink\.js/, 'detect.js');
+            el.onload = () => {
+                this._detectLoading = false;
+                // The view may have moved on while it loaded.
+                if (!window.neolinkDetect) return;
+                for (const z of Object.values(this._detectZoneStash || {}))
+                    window.neolinkDetect.zones(z);
+                window.neolinkDetect.sync(this._detectWant || null);
+            };
+            el.onerror = () => {
+                this._detectLoading = false;
+                console.warn('neolink: the object detector script could not be loaded');
+            };
+            document.head.appendChild(el);
+        },
+
+        // The camera's detection-zone grids for the boxes. Kept here as well as
+        // handed on, because the detector script may still be downloading — and
+        // sent only when they change: a grid is far too big to ride the per-render
+        // config across the circuit.
+        detectZones(payload) {
+            if (!payload || !payload.camera) return;
+            (this._detectZoneStash ||= {})[payload.camera] = payload;
+            if (window.neolinkDetect) window.neolinkDetect.zones(payload);
         },
 
         // Ambient event previews (review strip): ensure real muting, fast-forward
@@ -791,6 +834,28 @@
                 // An aborted load is our own doing (a swap, a close) — never an error.
                 const code = v.error?.code ?? 0;
                 if (code === 1) return;
+                // A damaged SD recording: this decoder stops where VLC conceals. Ask the
+                // server for a concealed re-encode once, and play that instead.
+                if (code === 3 && url.includes('/sdcard/download') && !url.includes('repair=1')
+                    && v.dataset.evUrl !== url + '&repair=1') {
+                    const repairUrl = url + '&repair=1';
+                    const rbox = errorBox();
+                    rbox?.querySelector('.video-error')?.remove();
+                    if (rbox) {
+                        const d = document.createElement('div');
+                        d.className = 'video-error';
+                        d.textContent = 'This recording is damaged on the camera; repairing a playable copy, ' +
+                                        'which can take a minute…';
+                        rbox.appendChild(d);
+                    }
+                    const resume = autoplay !== false || !v.paused;
+                    v.dataset.evUrl = repairUrl;
+                    v.src = repairUrl;
+                    v.addEventListener('loadeddata', () => errorBox()?.querySelector('.video-error')?.remove(), { once: true });
+                    try { v.load(); } catch { }
+                    if (resume) v.play().catch(() => { v.muted = true; v.play().catch(() => { }); });
+                    return;
+                }
                 const box = errorBox();
                 if (!box || box.querySelector('.video-error')) return;
                 const show = () => {
@@ -801,19 +866,28 @@
                     // decode failure is this device out of video decoders (phones
                     // have few) and no server log will mention it.
                     d.textContent = code === 3
-                        ? 'This device could not decode the video — close other camera views, ' +
-                          'or try SD quality or 1× speed.'
+                        ? (url.includes('/sdcard/download')
+                            ? 'This device could not decode this recording; the server log has its details.'
+                            : 'This device could not decode the video; close other camera views, ' +
+                              'or try SD quality or 1× speed.')
                         : code === 2
                             ? 'The connection dropped while loading this video.'
-                            : 'Playback failed — the server could not fetch this video. ' +
+                            : 'Playback failed: the server could not fetch this video. ' +
                               'The server log has the reason.';
                     box.appendChild(d);
+                    // An SD-card fetch remembers why it failed; ask, since a <video> can't read the body.
+                    if (code !== 3 && url.includes('/sdcard/download'))
+                        fetch(url + '&probe=1', { credentials: 'same-origin' })
+                            .then(r => r.status === 502 ? r.json() : null)
+                            .then(j => { if (j?.error && d.isConnected) d.textContent = 'Playback failed: ' + j.error; })
+                            .catch(() => { });
                 };
                 if (!ongoing) show();
                 else if (!v.dataset.evErrTimer)
                     v.dataset.evErrTimer = String(setTimeout(show, 7000));
             };
-            if (v.dataset.evUrl !== url) {
+            // A repaired SD copy stands in for its url: a re-render must not undo the swap.
+            if (v.dataset.evUrl !== url && v.dataset.evUrl !== url + '&repair=1') {
                 errorBox()?.querySelector('.video-error')?.remove();
                 clearErrTimer();
                 const at = (v.currentTime && isFinite(v.currentTime)) ? v.currentTime : 0;
@@ -1058,7 +1132,7 @@
                 if (btn.dataset.spk === state) return;
                 btn.dataset.spk = state;
                 btn.innerHTML = video.muted ? VOL_OFF : VOL_ON;
-                btn.title = video.muted ? 'Unmute — this camera has audio' : 'Mute';
+                btn.title = video.muted ? 'Unmute (this camera has audio)' : 'Mute';
             });
         },
 
@@ -1810,7 +1884,7 @@
                 '<div class="nerd-head">' +
                     '<span class="nerd-title">stats for nerds</span>' +
                     '<button type="button" class="nerd-btn" data-nerd-copy ' +
-                        'title="Copy this readout — paste it into a bug report">copy</button>' +
+                        'title="Copy this readout to paste into a bug report">copy</button>' +
                     '<button type="button" class="nerd-btn" data-nerd-close ' +
                         'title="Close (or right-click the video again)">✕</button>' +
                 '</div>' +
@@ -2323,7 +2397,7 @@
                 const elapsed = Date.now() - t0;
                 if (up && (sawDown || elapsed > 25000)) {
                     // Back up (or it bounced so fast we never caught it down): reload.
-                    sub.textContent = 'Server is back — reloading…';
+                    sub.textContent = 'Server is back, reloading…';
                     location.reload();
                     return;
                 }
